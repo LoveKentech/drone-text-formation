@@ -16,6 +16,26 @@ from config import IMAGE_SIZE, SIZES
 # size 문자열 → 배율 매핑
 _SCALE = {"small": 1.0, "medium": 1.5, "large": 2.0}
 
+# Pillow가 "arial.ttf"만 찾으면 기본 비트맵 폰트로 떨어져 픽셀이 부족해진다.
+# OS별로 흔한 sans-serif 경로를 순서대로 시도한다.
+_FONT_CANDIDATES = (
+    "arial.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "C:/Windows/Fonts/arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+)
+
+
+def _load_sans_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in _FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(path, size)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()
+
 
 def generate_coordinates(text: str, n: int, size: str) -> np.ndarray:
     """
@@ -60,11 +80,7 @@ def generate_coordinates(text: str, n: int, size: str) -> np.ndarray:
 
     # 기본 폰트 크기는 이미지 높이의 75% 수준으로 설정
     font_size = max(10, int(h * 0.75))
-    try:
-        font = ImageFont.truetype("arial.ttf", font_size)
-    except (IOError, OSError):
-        # 시스템에 Arial이 없을 경우 기본 비트맵 폰트 사용
-        font = ImageFont.load_default()
+    font = _load_sans_font(font_size)
 
     # 텍스트를 이미지 중앙에 배치
     bbox = draw.textbbox((0, 0), text, font=font)
