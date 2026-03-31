@@ -1,0 +1,253 @@
+"""
+드론 텍스트 포메이션 시뮬레이션의 진입점.
+config.py에 정의된 실험 조건을 순회하며 전체 파이프라인을 실행한다.
+"""
+
+import os
+import time
+from typing import Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from config import DRONE_COUNTS, STRINGS, SIZES, MAX_STEPS, MIN_SAFE_DIST
+from src.coordinate import generate_coordinates
+from src.hungarian import build_cost_matrix, hungarian_assign
+from src.timeline import (
+    compute_timeline_hungarian,
+    detect_collisions,
+    run_collision_resolution,
+)
+from src.cbs import cbs_assign
+from src.visualize import animate, compare_animate
+
+
+# ---------------------------------------------------------------------------
+# 내부 유틸리티
+# ---------------------------------------------------------------------------
+
+def _paths_to_frames(paths: Dict[int, list], n: int, max_steps: int) -> np.ndarray:
+    """CBS PathsDict → ndarray (max_steps, n, 2)."""
+    frames = np.zeros((max_steps, n, 2), dtype=float)
+    for i in range(n):
+        path = paths.get(i, [])
+        length = min(len(path), max_steps)
+        for t in range(length):
+            frames[t, i] = path[t]
+        if path:
+            last = path[min(len(path) - 1, max_steps - 1)]
+            for t in range(length, max_steps):
+                frames[t, i] = last
+    return frames
+
+
+def _trim_frames(frames: np.ndarray, tol: float = 1e-6) -> np.ndarray:
+    """드론이 모두 정지한 이후 프레임을 잘라낸다 (애니메이션 길이 단축)."""
+    if frames.shape[0] <= 2:
+        return frames
+    for t in range(frames.shape[0] - 1, 0, -1):
+        if np.any(np.linalg.norm(frames[t] - frames[t - 1], axis=1) > tol):
+            return frames[: t + 2]
+    return frames[:2]
+
+
+def _count_all_collisions(frames: np.ndarray, min_dist: float = MIN_SAFE_DIST) -> int:
+    """타임라인 전체에서 충돌 쌍 수를 합산한다."""
+    return sum(
+        len(detect_collisions(frames, t, min_dist)) for t in range(frames.shape[0])
+    )
+
+
+def _compute_dist_metrics(frames: np.ndarray):
+    """(total_dist, max_dist) — 전 드론 이동 거리 합, 단일 드론 최대 이동 거리."""
+    diffs       = np.diff(frames, axis=0)           # (T-1, n, 2)
+    step_dists  = np.linalg.norm(diffs, axis=2)     # (T-1, n)
+    drone_dists = step_dists.sum(axis=0)            # (n,)
+    return float(drone_dists.sum()), float(drone_dists.max())
+
+
+def _make_drones(targets: np.ndarray, n: int, text: str, size: str) -> np.ndarray:
+    """실험 조건별 고정 랜덤 시드로 드론 초기 위치를 생성한다."""
+    seed   = abs(hash((n, text, size))) % (2 ** 31)
+    rng    = np.random.default_rng(seed)
+    span   = targets.max() + 20.0
+    return rng.uniform(0, span, (n, 2))
+
+
+# ---------------------------------------------------------------------------
+# 핵심 실험 함수
+# ---------------------------------------------------------------------------
+
+def run_experiment(text: str, n: int, size: str, algorithm: str) -> Dict:
+    """
+    단일 실험 조건에 대해 전체 파이프라인을 실행하고 성능 지표를 반환한다.
+
+    Parameters
+    ----------
+    text      : 렌더링할 문자열
+    n         : 드론 수
+    size      : 이미지 배율 ("small" / "medium" / "large")
+    algorithm : "hungarian" | "cbs"
+
+    Returns
+    -------
+    dict — 성능 지표
+        algorithm, n, text, size,
+        total_dist, max_dist,
+        assign_time, collision_before, collision_after, total_time
+    """
+    total_start = time.perf_counter()
+
+    # ── 목표·초기 위치 ────────────────────────────────────────────────────
+    targets = generate_coordinates(text, n, size)
+    drones  = _make_drones(targets, n, text, size)
+
+    # ── 공통: Hungarian 배정 ──────────────────────────────────────────────
+    cost_matrix = build_cost_matrix(drones, targets)
+
+    t0             = time.perf_counter()
+    assignment     = hungarian_assign(cost_matrix)
+    hungarian_time = time.perf_counter() - t0
+
+    # ── 알고리즘별 경로 계획 ──────────────────────────────────────────────
+    # collision_before = greedy 타임라인(해결 전)의 충돌 수 (두 알고리즘 공통 기준)
+    frames_raw       = compute_timeline_hungarian(drones, targets, assignment)
+    collision_before = _count_all_collisions(frames_raw)
+
+    if algorithm == "hungarian":
+        assign_time = hungarian_time
+        frames, assignment, stats = run_collision_resolution(frames_raw, assignment)
+        collision_after = stats["remaining"]
+
+    else:  # cbs
+        t0 = time.perf_counter()
+        paths = cbs_assign(drones, targets, assignment, max_steps=MAX_STEPS)
+        assign_time = time.perf_counter() - t0
+
+        if paths is not None:
+            frames = _paths_to_frames(paths, n, MAX_STEPS)
+        else:
+            print(
+                f"  [WARN] CBS 탐색 실패 — Hungarian+resolve 폴백 "
+                f"(n={n}, text={text}, size={size})"
+            )
+            frames, assignment, _ = run_collision_resolution(frames_raw, assignment)
+
+        collision_after = _count_all_collisions(frames)
+
+    # ── 거리 지표 ─────────────────────────────────────────────────────────
+    total_dist, max_dist = _compute_dist_metrics(frames)
+    total_time = time.perf_counter() - total_start
+
+    return {
+        "algorithm":        algorithm,
+        "n":                n,
+        "text":             text,
+        "size":             size,
+        "total_dist":       round(total_dist, 3),
+        "max_dist":         round(max_dist, 3),
+        "assign_time":      round(assign_time, 4),
+        "collision_before": collision_before,
+        "collision_after":  collision_after,
+        "total_time":       round(total_time, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 결과 저장
+# ---------------------------------------------------------------------------
+
+def save_results(
+    results: List[Dict],
+    filename: str = "results/experiment.csv",
+) -> None:
+    """실험 결과를 pandas DataFrame으로 변환 후 CSV에 저장한다."""
+    os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+    pd.DataFrame(results).to_csv(filename, index=False, encoding="utf-8-sig")
+    print(f"[저장] {filename}")
+
+
+# ---------------------------------------------------------------------------
+# 애니메이션 저장
+# ---------------------------------------------------------------------------
+
+def _save_animations(text: str = "LOVE", n: int = 50, size: str = "medium") -> None:
+    """대표 케이스(n=50, LOVE, medium) 애니메이션 3종을 output/에 저장한다."""
+    os.makedirs("output", exist_ok=True)
+
+    targets    = generate_coordinates(text, n, size)
+    drones     = _make_drones(targets, n, text, size)
+    cost_matrix = build_cost_matrix(drones, targets)
+    assignment  = hungarian_assign(cost_matrix)
+
+    # Hungarian 프레임
+    frames_h_raw = compute_timeline_hungarian(drones, targets, assignment)
+    frames_h, _, _ = run_collision_resolution(frames_h_raw, assignment)
+    frames_h = _trim_frames(frames_h)
+
+    # CBS 프레임
+    paths = cbs_assign(drones, targets, assignment, max_steps=MAX_STEPS)
+    if paths is not None:
+        frames_c = _trim_frames(_paths_to_frames(paths, n, MAX_STEPS))
+    else:
+        print(f"[WARN] 대표 케이스 CBS 실패 — Hungarian 결과로 대체")
+        frames_c = frames_h
+
+    h_path = f"output/hungarian_{text}_{n}.gif"
+    c_path = f"output/cbs_{text}_{n}.gif"
+    cmp_path = f"output/compare_{text}_{n}.gif"
+
+    print(f"[GIF] {h_path}")
+    animate(frames_h, targets,
+            title=f"Hungarian | {text} | n={n} | {size}",
+            save_path=h_path)
+
+    print(f"[GIF] {c_path}")
+    animate(frames_c, targets,
+            title=f"CBS | {text} | n={n} | {size}",
+            save_path=c_path)
+
+    print(f"[GIF] {cmp_path}")
+    compare_animate(frames_h, frames_c, targets, save_path=cmp_path)
+
+    print("[GIF] 저장 완료")
+
+
+# ---------------------------------------------------------------------------
+# 진입점
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("드론 텍스트 포메이션 실험 시작")
+    print("=" * 60)
+
+    results: List[Dict] = []
+    algorithms = ["hungarian", "cbs"]
+    total = len(algorithms) * len(DRONE_COUNTS) * len(STRINGS) * len(SIZES)
+    idx = 0
+
+    for algorithm in algorithms:
+        for n in DRONE_COUNTS:
+            for text in STRINGS:
+                for size in SIZES:
+                    idx += 1
+                    print(
+                        f"[{idx:>3}/{total}] {algorithm:10s} | "
+                        f"n={n:>3} | {text:>7} | {size}"
+                    )
+                    result = run_experiment(text, n, size, algorithm)
+                    results.append(result)
+                    print(
+                        f"         총거리={result['total_dist']:.1f}  "
+                        f"충돌 {result['collision_before']}→{result['collision_after']}  "
+                        f"배정={result['assign_time']:.3f}s  "
+                        f"전체={result['total_time']:.2f}s"
+                    )
+
+    save_results(results, "results/experiment.csv")
+
+    print("\n[애니메이션] 대표 케이스 (n=50, LOVE, medium) 생성 중 ...")
+    _save_animations(text="LOVE", n=50, size="medium")
+
+    print("\n실험 완료.")

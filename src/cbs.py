@@ -1,0 +1,455 @@
+"""
+CBS(Conflict-Based Search) 알고리즘을 구현하는 모듈.
+다수 드론의 충돌을 감지하고 제약 조건을 추가해 충돌 없는 경로를 탐색한다.
+
+구조
+----
+High-Level : 충돌 발견 시 제약 조건 트리를 분기하며 best-first(최소 비용 우선) 탐색.
+Low-Level  : 각 드론마다 astar_with_constraints로 단일 경로를 재계획.
+
+탐색 공간  : (x, y, t) — 2D 위치 + 시각의 3차원 격자.
+이동 모델  : 8방향(상하좌우+대각) + 제자리 대기(wait), 총 9가지 액션.
+"""
+
+import heapq
+import itertools
+import os
+import sys
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import MAX_STEPS
+
+# 8방향 이동 + 제자리 대기 (dx=0, dy=0)
+_MOVES: List[Tuple[int, int]] = [
+    (dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+]
+
+# 타입 별칭
+Pos        = Tuple[int, int]
+Constraint = Tuple[int, int, int]   # (x, y, t)
+Path       = List[Pos]
+PathsDict  = Dict[int, Path]
+
+
+# ---------------------------------------------------------------------------
+# Low-Level : 제약 조건 A*
+# ---------------------------------------------------------------------------
+
+def astar_with_constraints(
+    start: Pos,
+    goal: Pos,
+    constraints: Set[Constraint],
+    max_steps: int,
+) -> Optional[Path]:
+    """
+    제약 조건을 피하며 start → goal 최단 경로를 (x, y, t) 3차원 A*로 탐색한다.
+
+    핵심 규칙
+    ---------
+    - 제약 조건 (x, y, t) : 시각 t에 위치 (x, y) 점유 불가.
+    - 목표 점유 제약 처리 : 드론이 goal에 도착한 뒤 제자리 대기(패딩)가 충돌로
+      이어질 수 있으므로, goal에 대한 제약 중 가장 늦은 시각(latest_goal_constraint)
+      보다 '이후'에 도착해야만 경로를 확정한다.
+    - 휴리스틱 : Chebyshev 거리 (8방향 이동에 대해 허용적, admissible).
+
+    Parameters
+    ----------
+    start       : (x, y) 출발 위치 (정수 좌표)
+    goal        : (x, y) 목표 위치 (정수 좌표)
+    constraints : {(x, y, t), ...} — 이 드론에게 금지된 (위치, 시각) 집합
+    max_steps   : 탐색 깊이 한계 (이 시각 이후 노드는 확장하지 않음)
+
+    Returns
+    -------
+    Path (start ~ goal 포함한 위치 리스트), 또는 None (경로 없음)
+
+    Example
+    -------
+    # path = astar_with_constraints((0, 0), (5, 3), set(), max_steps=50)
+    # assert path[0] == (0, 0) and path[-1] == (5, 3)
+    """
+    sx, sy = start
+    gx, gy = goal
+
+    # goal에 걸린 제약 중 가장 늦은 시각 → 그 이후에 도착해야 안전
+    latest_goal_constraint: int = max(
+        (t for (x, y, t) in constraints if x == gx and y == gy),
+        default=-1,
+    )
+
+    def h(x: int, y: int) -> int:
+        return max(abs(x - gx), abs(y - gy))  # Chebyshev distance
+
+    # 힙: (f, g, x, y, t)
+    open_heap: list = []
+    heapq.heappush(open_heap, (h(sx, sy), 0, sx, sy, 0))
+
+    came_from: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
+    g_score: Dict[Tuple[int, int, int], int] = {(sx, sy, 0): 0}
+
+    while open_heap:
+        f, g, x, y, t = heapq.heappop(open_heap)
+
+        cur_state = (x, y, t)
+
+        # 오래된(stale) 힙 항목 무시 (lazy deletion)
+        if g > g_score.get(cur_state, float("inf")):
+            continue
+
+        # 목표 도달 확인 — goal 제약이 모두 지난 시각이어야 확정
+        if (x, y) == (gx, gy) and t > latest_goal_constraint:
+            path: Path = []
+            cur = cur_state
+            while cur in came_from:
+                path.append((cur[0], cur[1]))
+                cur = came_from[cur]
+            path.append((cur[0], cur[1]))
+            path.reverse()
+            return path
+
+        if t >= max_steps:
+            continue
+
+        # 인접 노드 확장
+        for dx, dy in _MOVES:
+            nx, ny, nt = x + dx, y + dy, t + 1
+            if (nx, ny, nt) in constraints:
+                continue
+            new_g = g + 1
+            new_state = (nx, ny, nt)
+            if new_g < g_score.get(new_state, float("inf")):
+                g_score[new_state] = new_g
+                came_from[new_state] = cur_state
+                heapq.heappush(open_heap, (new_g + h(nx, ny), new_g, nx, ny, nt))
+
+    return None  # 경로 없음
+
+
+# ---------------------------------------------------------------------------
+# High-Level 보조 : 충돌 감지
+# ---------------------------------------------------------------------------
+
+def detect_conflict(paths: PathsDict) -> Optional[dict]:
+    """
+    모든 드론 경로를 검사해 첫 번째 충돌을 반환한다.
+
+    경로 길이가 다를 경우 마지막 위치로 패딩하여 비교한다
+    (드론이 목표에 도달한 뒤 제자리에 머문다고 가정).
+
+    충돌 유형
+    ---------
+    vertex : 같은 시각 t에 두 드론이 동일 위치를 점유.
+    edge   : t→t+1 사이에 두 드론이 위치를 맞바꿈 (교차 이동).
+
+    Parameters
+    ----------
+    paths : {drone_id: [(x, y), ...]} — 드론별 경로
+
+    Returns
+    -------
+    충돌 정보 dict, 또는 None (충돌 없음)
+
+    반환 dict 구조
+    ~~~~~~~~~~~~~~
+    {
+        'type'   : 'vertex' | 'edge',
+        'agents' : (i, j),           # 충돌 드론 쌍
+        'pos'    : (x, y),           # vertex: 충돌 위치 / edge: 드론 i의 t+1 위치
+        'pos_j'  : (x, y) | None,    # edge only: 드론 j의 t+1 위치
+        't'      : int,              # vertex: 충돌 시각 / edge: 교차 시작 시각
+    }
+
+    Example
+    -------
+    # vertex conflict
+    # c = detect_conflict({0: [(0,0),(1,0)], 1: [(2,0),(1,0)]})
+    # assert c['type'] == 'vertex' and c['t'] == 1
+    #
+    # edge conflict
+    # c = detect_conflict({0: [(0,0),(1,0)], 1: [(1,0),(0,0)]})
+    # assert c['type'] == 'edge' and c['t'] == 0
+    """
+    agents = list(paths.keys())
+    if len(agents) < 2:
+        return None
+
+    max_len = max(len(p) for p in paths.values())
+
+    def get_pos(aid: int, t: int) -> Pos:
+        p = paths[aid]
+        return p[t] if t < len(p) else p[-1]
+
+    for t in range(max_len):
+        # ── Vertex conflict ──────────────────────────────────────────────
+        pos_owner: Dict[Pos, int] = {}
+        for aid in agents:
+            pos = get_pos(aid, t)
+            if pos in pos_owner:
+                return {
+                    "type": "vertex",
+                    "agents": (pos_owner[pos], aid),
+                    "pos": pos,
+                    "pos_j": None,
+                    "t": t,
+                }
+            pos_owner[pos] = aid
+
+        # ── Edge conflict (swap) ─────────────────────────────────────────
+        if t + 1 < max_len:
+            n = len(agents)
+            for ii in range(n):
+                for jj in range(ii + 1, n):
+                    ai, aj = agents[ii], agents[jj]
+                    pi_t,  pj_t  = get_pos(ai, t),     get_pos(aj, t)
+                    pi_t1, pj_t1 = get_pos(ai, t + 1), get_pos(aj, t + 1)
+                    if pi_t == pj_t1 and pj_t == pi_t1:
+                        return {
+                            "type": "edge",
+                            "agents": (ai, aj),
+                            "pos":   pi_t1,  # 드론 i의 t+1 위치
+                            "pos_j": pj_t1,  # 드론 j의 t+1 위치
+                            "t": t,
+                        }
+
+    return None  # 충돌 없음
+
+
+# ---------------------------------------------------------------------------
+# High-Level : CBS 메인
+# ---------------------------------------------------------------------------
+
+def cbs_assign(
+    drones: np.ndarray,
+    targets: np.ndarray,
+    assignment: np.ndarray,
+    max_steps: int = MAX_STEPS,
+) -> Optional[PathsDict]:
+    """
+    CBS(Conflict-Based Search)로 드론 전체의 충돌 없는 경로를 탐색한다.
+
+    알고리즘 흐름
+    -------------
+    1. 초기화 : 제약 없이 각 드론에 대해 A*로 최단 경로 계획.
+    2. 루프    : 우선순위 큐(최소 비용 우선)에서 CBS 노드를 꺼낸다.
+       a. 충돌 없음 → 해 반환.
+       b. 충돌 발견 → 충돌 드론 쌍에 대해 각각 제약 추가 후 A* 재계획,
+          두 자식 노드를 큐에 삽입.
+    3. 반복 횟수 초과 or 큐 소진 → None 반환.
+
+    제약 조건 형식 : frozenset of (x, y, t)  (드론별로 독립 관리)
+
+    Parameters
+    ----------
+    drones     : ndarray (n, 2) — 드론 초기 위치
+    targets    : ndarray (n, 2) — 목표 좌표 집합 (generate_coordinates 결과)
+    assignment : ndarray (n,)   — hungarian_assign 결과. assignment[i] = 드론 i의 목표 인덱스
+    max_steps  : A* 탐색 깊이 제한 (기본값 config.MAX_STEPS)
+
+    Returns
+    -------
+    {drone_id: [(x, y), ...]} — 드론별 충돌 없는 경로, 또는 None
+
+    주의
+    ----
+    - CBS 탐색 트리는 최악의 경우 지수적으로 성장한다.
+      n이 클수록 (≥ 50) max_iterations 내에 해를 못 찾을 수 있음.
+    - 해를 못 찾으면 None 반환 → 호출부(timeline.py)에서 폴백 처리 권장.
+
+    Example
+    -------
+    # paths = cbs_assign(drones, targets, assignment, max_steps=100)
+    # if paths is None:
+    #     print("CBS 탐색 실패 — 폴백 경로 사용")
+    # else:
+    #     assert detect_conflict(paths) is None
+    """
+    n = len(drones)
+
+    # 실수 좌표 → 정수 격자 좌표 변환
+    starts: List[Pos] = [
+        (int(round(drones[i][0])), int(round(drones[i][1]))) for i in range(n)
+    ]
+    goals: List[Pos] = [
+        (int(round(targets[assignment[i]][0])), int(round(targets[assignment[i]][1])))
+        for i in range(n)
+    ]
+
+    # ── 초기 경로 계획 (제약 없음) ────────────────────────────────────────
+    init_paths: PathsDict = {}
+    for i in range(n):
+        path = astar_with_constraints(starts[i], goals[i], set(), max_steps)
+        if path is None:
+            return None  # 기본 경로조차 없으면 즉시 실패
+        init_paths[i] = path
+
+    def total_cost(paths: PathsDict) -> int:
+        """Sum-of-Costs : 모든 드론 경로 길이의 합."""
+        return sum(len(p) for p in paths.values())
+
+    # ── CBS 우선순위 큐 초기화 ────────────────────────────────────────────
+    # 힙 원소: (cost, tiebreak_id, constraints_dict, paths_dict)
+    # constraints_dict : {drone_id: frozenset of (x, y, t)}
+    counter = itertools.count()
+    init_constraints: Dict[int, FrozenSet[Constraint]] = {
+        i: frozenset() for i in range(n)
+    }
+    open_list: list = [
+        (total_cost(init_paths), next(counter), init_constraints, init_paths)
+    ]
+
+    max_iterations = 2_000  # CBS 고수준 탐색 반복 상한
+
+    for _ in range(max_iterations):
+        if not open_list:
+            return None
+
+        cost, _, constraints, paths = heapq.heappop(open_list)
+
+        conflict = detect_conflict(paths)
+        if conflict is None:
+            return paths  # ★ 충돌 없는 해 발견
+
+        ai, aj = conflict["agents"]
+
+        # ── 두 자식 노드 생성 ─────────────────────────────────────────────
+        for agent in (ai, aj):
+            # 충돌 유형에 따라 추가할 제약 결정
+            if conflict["type"] == "vertex":
+                # vertex : 해당 위치·시각을 금지
+                cx, cy = conflict["pos"]
+                ct = conflict["t"]
+            else:
+                # edge   : 교차 이동 시 agent가 t+1에 진입하는 위치를 금지
+                pos = conflict["pos"] if agent == ai else conflict["pos_j"]
+                cx, cy = pos
+                ct = conflict["t"] + 1
+
+            new_constraints = dict(constraints)
+            new_constraints[agent] = constraints[agent] | frozenset([(cx, cy, ct)])
+
+            # 해당 드론만 재계획
+            new_path = astar_with_constraints(
+                starts[agent],
+                goals[agent],
+                set(new_constraints[agent]),
+                max_steps,
+            )
+            if new_path is None:
+                continue  # 이 브랜치는 해 없음 → 스킵
+
+            new_paths = dict(paths)
+            new_paths[agent] = new_path
+
+            heapq.heappush(
+                open_list,
+                (total_cost(new_paths), next(counter), new_constraints, new_paths),
+            )
+
+    return None  # 반복 상한 초과
+
+
+# ---------------------------------------------------------------------------
+# 단위 테스트
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import time
+
+    sys.path.insert(0, os.path.dirname(__file__))  # src/ 경로 추가
+    from hungarian import build_cost_matrix, hungarian_assign
+
+    print("=== astar_with_constraints 단위 테스트 ===\n")
+
+    # 1) 기본 경로 탐색
+    path = astar_with_constraints((0, 0), (5, 5), set(), max_steps=50)
+    assert path is not None and path[0] == (0, 0) and path[-1] == (5, 5)
+    assert len(path) == 6  # Chebyshev 거리 5 → 6 스텝(start 포함)
+    print("[PASS] (0,0)→(5,5) 최단 경로 길이 = 6")
+
+    # 2) start == goal
+    path_trivial = astar_with_constraints((3, 3), (3, 3), set(), max_steps=20)
+    assert path_trivial == [(3, 3)]
+    print("[PASS] start == goal → [(3,3)]")
+
+    # 3) 제약 조건 회피
+    #    (2, 0) ~ (2, 2) 를 t=1~3 에 막으면 우회해야 함
+    blocked = {(2, y, t) for y in range(-1, 3) for t in range(1, 6)}
+    path_detour = astar_with_constraints((0, 0), (4, 0), blocked, max_steps=30)
+    assert path_detour is not None and path_detour[-1] == (4, 0)
+    for pos, t in zip(path_detour, range(len(path_detour))):
+        assert (pos[0], pos[1], t) not in blocked, f"제약 위반: {pos} at t={t}"
+    print("[PASS] 장애물 회피 경로 생성 및 제약 미위반 확인")
+
+    # 4) 불가능한 경로 → None
+    impossible = {(x, y, t) for x in range(-5, 10) for y in range(-5, 10) for t in range(1, 30)}
+    path_none = astar_with_constraints((0, 0), (5, 5), impossible, max_steps=20)
+    assert path_none is None
+    print("[PASS] 탈출 불가 제약 → None 반환")
+
+    print("\n=== detect_conflict 단위 테스트 ===\n")
+
+    # 5) Vertex conflict
+    vc = detect_conflict({0: [(0, 0), (1, 0)], 1: [(2, 0), (1, 0)]})
+    assert vc is not None and vc["type"] == "vertex" and vc["t"] == 1
+    print("[PASS] vertex conflict : t=1, pos=(1,0)")
+
+    # 6) Edge conflict (swap)
+    ec = detect_conflict({0: [(0, 0), (1, 0)], 1: [(1, 0), (0, 0)]})
+    assert ec is not None and ec["type"] == "edge" and ec["t"] == 0
+    print("[PASS] edge conflict : t=0 교차 이동 감지")
+
+    # 7) No conflict
+    nc = detect_conflict({0: [(0, 0), (1, 0), (2, 0)], 1: [(0, 2), (1, 2), (2, 2)]})
+    assert nc is None
+    print("[PASS] 충돌 없는 경로 → None 반환")
+
+    # 8) 경로 길이 불일치 (패딩 테스트)
+    #    drone0 이 (1,0)에 먼저 도달 후 대기, drone1이 나중에 (1,0) 진입
+    padded_conflict = detect_conflict({
+        0: [(0, 0), (1, 0)],             # t=1부터 (1,0)에 정박
+        1: [(3, 0), (2, 0), (1, 0)],     # t=2에 (1,0) 도달 → vertex conflict
+    })
+    assert padded_conflict is not None and padded_conflict["type"] == "vertex"
+    print("[PASS] 경로 길이 불일치 패딩 후 vertex conflict 감지")
+
+    print("\n=== cbs_assign 단위 테스트 (n=10) ===\n")
+
+    # 9) Trivial : 모든 드론이 이미 목표에 위치
+    n = 5
+    pts = np.array([[float(i * 10), 0.0] for i in range(n)])
+    asgn = np.arange(n)
+    paths_trivial = cbs_assign(pts, pts, asgn, max_steps=30)
+    assert paths_trivial is not None
+    assert detect_conflict(paths_trivial) is None
+    print("[PASS] trivial: 각 드론 이미 목표 위치, 충돌 없음")
+
+    # 10) 2-드론 교차 충돌 해결
+    d2 = np.array([[0.0, 0.0], [6.0, 0.0]])
+    t2 = np.array([[6.0, 0.0], [0.0, 0.0]])
+    a2 = np.array([0, 1])
+    paths2 = cbs_assign(d2, t2, a2, max_steps=30)
+    assert paths2 is not None and detect_conflict(paths2) is None
+    print("[PASS] 2-드론 교차 충돌 해결 성공")
+
+    # 11) n=10 랜덤 케이스
+    rng = np.random.default_rng(42)
+    n = 10
+    d10 = rng.uniform(0, 20, (n, 2))
+    t10 = rng.uniform(0, 20, (n, 2))
+    a10 = hungarian_assign(build_cost_matrix(d10, t10))
+
+    t_start = time.time()
+    paths10 = cbs_assign(d10, t10, a10, max_steps=80)
+    elapsed = time.time() - t_start
+
+    if paths10 is not None:
+        assert detect_conflict(paths10) is None
+        avg_len = sum(len(p) for p in paths10.values()) / n
+        print(f"[PASS] n=10 CBS 탐색 성공  ({elapsed:.2f}s, 평균 경로 길이 {avg_len:.1f})")
+    else:
+        print(f"[WARN] n=10 CBS 탐색 실패 — max_steps/max_iterations 조정 필요 ({elapsed:.2f}s)")
+
+    print("\n모든 테스트 완료.")

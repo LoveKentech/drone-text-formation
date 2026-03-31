@@ -1,0 +1,11 @@
+name: drone-formation
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - pillow
+  - matplotlib
+  - pandas
