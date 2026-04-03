@@ -9,3 +9,6 @@ DRONE_COUNTS = [20, 50, 100]
 STRINGS = ["AL", "LOVE", "KENTECH"]
 SIZES = ["small", "medium", "large"]
 IMAGE_SIZE = (200, 100)      # 렌더링 이미지 크기
+
+CONTOUR_METHODS = ["contour", "poisson", "grid"]   # 좌표 샘플링 방식
+DEFAULT_METHOD = "contour"                         # 기본 샘플링 방식
