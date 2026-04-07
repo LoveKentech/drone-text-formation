@@ -143,16 +143,17 @@ def detect_collisions(
 def resolve_collisions(
     frames: np.ndarray,
     assignment: np.ndarray,
+    targets: np.ndarray,
     collisions: List[Tuple[int, int]],
     t: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     detect_collisions 결과를 받아 3단계 우선순위로 충돌을 해결한다.
 
-    목표 위치 추정
-    --------------
-    명시적 targets 배열 없이 frames[-1, i] 를 드론 i 의 유효 목표로 사용한다.
-    (compute_timeline_hungarian 이후 np.sign 수렴 결과가 목표 근방에 위치하기 때문.)
+    목표 위치
+    ---------
+    드론 i의 목표는 항상 ``targets[assignment[i]]`` (헝가리안 배정 후 목표 좌표)이다.
+    assignment 스왑 이후에도 일관되게 재경로화하기 위해 frames[-1]은 사용하지 않는다.
 
     우선순위
     --------
@@ -166,6 +167,7 @@ def resolve_collisions(
     ----------
     frames      : ndarray (max_steps, n, 2) — in-place 수정됨
     assignment  : ndarray (n,) — 드론-목표 인덱스 매핑 (복사본 반환)
+    targets     : ndarray (n, 2) — 목표 좌표 집합 (coordinate 등에서 생성)
     collisions  : list of (a, b) — detect_collisions 반환값
     t           : 충돌 발생 시각
 
@@ -175,17 +177,18 @@ def resolve_collisions(
 
     Example
     -------
-    # frames, assignment = resolve_collisions(frames, assignment, [(0, 1)], t=3)
+    # frames, assignment = resolve_collisions(frames, assignment, targets, [(0, 1)], t=3)
     # assert detect_collisions(frames, t=3) == []  # 해결 후 충돌 없음 (이상적)
     """
     max_steps  = frames.shape[0]
     assignment = assignment.copy()
 
     for (a, b) in collisions:
-        pos_a  = frames[t, a]
-        pos_b  = frames[t, b]
-        goal_a = frames[-1, a].copy()   # 유효 목표 (근사)
-        goal_b = frames[-1, b].copy()
+        pos_a = frames[t, a]
+        pos_b = frames[t, b]
+
+        goal_a = targets[assignment[a]].copy()
+        goal_b = targets[assignment[b]].copy()
 
         dir_a = np.sign(goal_a - pos_a)
         dir_b = np.sign(goal_b - pos_b)
@@ -195,17 +198,19 @@ def resolve_collisions(
             # ── Strategy 1 : Head-on → 목표 swap ────────────────────────
             assignment[a], assignment[b] = int(assignment[b]), int(assignment[a])
             if t + 1 < max_steps:
-                # t+1 위치: 각자 상대방의 유효 목표 방향으로 한 칸
-                frames[t + 1, a] = pos_a + np.sign(goal_b - pos_a)
-                frames[t + 1, b] = pos_b + np.sign(goal_a - pos_b)
-                _recompute_from_goal(frames, a, goal_b, t + 2)
-                _recompute_from_goal(frames, b, goal_a, t + 2)
+                ga = targets[assignment[a]]
+                gb = targets[assignment[b]]
+                frames[t + 1, a] = pos_a + np.sign(ga - pos_a)
+                frames[t + 1, b] = pos_b + np.sign(gb - pos_b)
+                _recompute_from_goal(frames, a, ga, t + 2)
+                _recompute_from_goal(frames, b, gb, t + 2)
             continue
 
         if t + 1 >= max_steps:
             continue
 
         # ── Strategy 2 : 경로 회피 (b가 a를 장애물로 간주) ──────────────
+        goal_b = targets[assignment[b]]
         next_pos_a = frames[t + 1, a]
 
         best_pos  = None
@@ -235,6 +240,7 @@ def resolve_collisions(
 def run_collision_resolution(
     frames: np.ndarray,
     assignment: np.ndarray,
+    targets: np.ndarray,
     min_dist: float = MIN_SAFE_DIST,
 ) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """
@@ -246,6 +252,7 @@ def run_collision_resolution(
     ----------
     frames     : ndarray (max_steps, n, 2) — compute_timeline_hungarian 결과
     assignment : ndarray (n,)              — hungarian_assign 결과
+    targets    : ndarray (n, 2)            — 목표 좌표 (충돌 해결 시 재경로화에 사용)
     min_dist   : 충돌 판정 거리 기준 (기본값 MIN_SAFE_DIST)
 
     Returns
@@ -263,7 +270,7 @@ def run_collision_resolution(
 
     Example
     -------
-    # frames, assignment, stats = run_collision_resolution(frames, assignment)
+    # frames, assignment, stats = run_collision_resolution(frames, assignment, targets)
     # print(f"감지: {stats['total_detected']}, 잔여: {stats['remaining']}")
     # resolution_rate = 1 - stats['remaining'] / max(stats['total_detected'], 1)
     """
@@ -285,7 +292,7 @@ def run_collision_resolution(
         per_step[t]           = cnt
         steps_with_collision += 1
 
-        frames, assignment = resolve_collisions(frames, assignment, collisions, t)
+        frames, assignment = resolve_collisions(frames, assignment, targets, collisions, t)
 
     # ── 잔여 충돌 집계 ────────────────────────────────────────────────────
     # resolve 는 t+1 이후만 수정할 수 있으므로, 중간 t에서 재확인하면 항상 0%가 나온다.
@@ -377,7 +384,7 @@ if __name__ == "__main__":
     cols_ho = detect_collisions(f_ho, t=4, min_dist=MIN_SAFE_DIST)
     assert cols_ho, "t=4에서 head-on 충돌이 감지되어야 함"
 
-    f_ho, a_ho = resolve_collisions(f_ho, a_ho, cols_ho, t=4)
+    f_ho, a_ho = resolve_collisions(f_ho, a_ho, tgt_ho, cols_ho, t=4)
 
     # t=4 자체는 이미 발생한 충돌이므로 여전히 존재 (물리적으로 되돌릴 수 없음)
     # t=5 이후부터 충돌이 해소됐는지 확인
@@ -389,7 +396,7 @@ if __name__ == "__main__":
     # 7) Wait 확인: b를 둘러싼 모든 칸이 막힌 가상 상황은 구현이 복잡하므로
     #    대신 반환 타입과 frames 불변성(입력 수정 안 됨) 확인
     f_test = f_ho.copy()
-    f_ret, a_ret = resolve_collisions(f_test, a_ho.copy(), [], t=0)
+    f_ret, a_ret = resolve_collisions(f_test, a_ho.copy(), tgt_ho, [], t=0)
     assert isinstance(f_ret, np.ndarray) and isinstance(a_ret, np.ndarray)
     print("[PASS] 빈 충돌 목록 → frames/assignment 타입 정상 반환")
 
@@ -408,7 +415,7 @@ if __name__ == "__main__":
     asgn10 = hungarian_assign(build_cost_matrix(d10, t10))
     f10    = compute_timeline_hungarian(d10, t10, asgn10, max_steps=80)
 
-    f_res, a_res, stats = run_collision_resolution(f10, asgn10, min_dist=MIN_SAFE_DIST)
+    f_res, a_res, stats = run_collision_resolution(f10, asgn10, t10, min_dist=MIN_SAFE_DIST)
 
     # 반환 타입 및 shape 확인
     assert f_res.shape == f10.shape
@@ -442,7 +449,7 @@ if __name__ == "__main__":
     # 10) 입력 배열 불변성 (run_collision_resolution이 복사본 사용)
     f10_backup   = f10.copy()
     asgn10_backup = asgn10.copy()
-    run_collision_resolution(f10, asgn10)
+    run_collision_resolution(f10, asgn10, t10)
     assert np.allclose(f10, f10_backup),    "입력 frames가 외부에서 수정됨"
     assert np.array_equal(asgn10, asgn10_backup), "입력 assignment가 외부에서 수정됨"
     print("[PASS] 입력 배열 불변성 확인 (내부 복사본 사용)")

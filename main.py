@@ -3,6 +3,7 @@
 config.py에 정의된 실험 조건을 순회하며 전체 파이프라인을 실행한다.
 """
 
+import hashlib
 import os
 import time
 from typing import Dict, List, Optional
@@ -12,12 +13,11 @@ import pandas as pd
 
 from config import DRONE_COUNTS, STRINGS, SIZES, MAX_STEPS, MIN_SAFE_DIST
 from src.coordinate import generate_coordinates
-from src.hungarian import build_cost_matrix, hungarian_assign
-from src.timeline import (
-    compute_timeline_hungarian,
-    detect_collisions,
-    run_collision_resolution,
+from src.hungarian_collision import (
+    greedy_timeline_then_resolve,
+    hungarian_assignment,
 )
+from src.timeline import compute_timeline_hungarian, detect_collisions
 from src.cbs import cbs_assign
 from src.visualize import animate, compare_animate
 
@@ -68,7 +68,9 @@ def _compute_dist_metrics(frames: np.ndarray):
 
 def _make_drones(targets: np.ndarray, n: int, text: str, size: str) -> np.ndarray:
     """실험 조건별 고정 랜덤 시드로 드론 초기 위치를 생성한다."""
-    seed   = abs(hash((n, text, size))) % (2 ** 31)
+    # hash()는 프로세스마다 달라지므로 재현 가능한 시드로 고정한다.
+    digest = hashlib.sha256(f"{n}|{text}|{size}".encode()).digest()
+    seed   = int.from_bytes(digest[:4], "little") % (2**31)
     rng    = np.random.default_rng(seed)
     span   = targets.max() + 20.0
     return rng.uniform(0, span, (n, 2))
@@ -103,20 +105,20 @@ def run_experiment(text: str, n: int, size: str, algorithm: str) -> Dict:
     drones  = _make_drones(targets, n, text, size)
 
     # ── 공통: Hungarian 배정 ──────────────────────────────────────────────
-    cost_matrix = build_cost_matrix(drones, targets)
-
-    t0             = time.perf_counter()
-    assignment     = hungarian_assign(cost_matrix)
+    t0 = time.perf_counter()
+    _, assignment = hungarian_assignment(drones, targets)
     hungarian_time = time.perf_counter() - t0
 
     # ── 알고리즘별 경로 계획 ──────────────────────────────────────────────
     # collision_before = greedy 타임라인(해결 전)의 충돌 수 (두 알고리즘 공통 기준)
-    frames_raw       = compute_timeline_hungarian(drones, targets, assignment)
+    frames_raw = compute_timeline_hungarian(drones, targets, assignment)
     collision_before = _count_all_collisions(frames_raw)
 
     if algorithm == "hungarian":
         assign_time = hungarian_time
-        frames, assignment, stats = run_collision_resolution(frames_raw, assignment)
+        frames, assignment, stats, _ = greedy_timeline_then_resolve(
+            drones, targets, assignment, frames_raw=frames_raw
+        )
         collision_after = stats["remaining"]
 
     else:  # cbs
@@ -131,7 +133,9 @@ def run_experiment(text: str, n: int, size: str, algorithm: str) -> Dict:
                 f"  [WARN] CBS 탐색 실패 — Hungarian+resolve 폴백 "
                 f"(n={n}, text={text}, size={size})"
             )
-            frames, assignment, _ = run_collision_resolution(frames_raw, assignment)
+            frames, assignment, _, _ = greedy_timeline_then_resolve(
+                drones, targets, assignment, frames_raw=frames_raw
+            )
 
         collision_after = _count_all_collisions(frames)
 
@@ -177,12 +181,13 @@ def _save_animations(text: str = "LOVE", n: int = 50, size: str = "medium") -> N
 
     targets    = generate_coordinates(text, n, size)
     drones     = _make_drones(targets, n, text, size)
-    cost_matrix = build_cost_matrix(drones, targets)
-    assignment  = hungarian_assign(cost_matrix)
+    _, assignment = hungarian_assignment(drones, targets)
 
     # Hungarian 프레임
     frames_h_raw = compute_timeline_hungarian(drones, targets, assignment)
-    frames_h, _, _ = run_collision_resolution(frames_h_raw, assignment)
+    frames_h, _, _, _ = greedy_timeline_then_resolve(
+        drones, targets, assignment, frames_raw=frames_h_raw
+    )
     frames_h = _trim_frames(frames_h)
 
     # CBS 프레임
