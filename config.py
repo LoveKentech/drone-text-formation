@@ -10,5 +10,8 @@ STRINGS = ["AL", "LOVE", "KENTECH"]
 SIZES = ["small", "medium", "large"]
 IMAGE_SIZE = (200, 100)      # 렌더링 이미지 크기
 
+# PIL 렌더링 시 글자 사이에 더 넣을 간격(px). 0이면 폰트 기본 자간만 사용.
+LETTER_SPACING_PX = 10.0
+
 CONTOUR_METHODS = ["contour", "poisson", "grid"]   # 좌표 샘플링 방식
 DEFAULT_METHOD = "contour"                         # 기본 샘플링 방식

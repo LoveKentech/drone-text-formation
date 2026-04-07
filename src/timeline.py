@@ -104,6 +104,54 @@ def compute_timeline_hungarian(
     return frames
 
 
+def compute_timeline_linear(
+    drones: np.ndarray,
+    targets: np.ndarray,
+    assignment: np.ndarray,
+    max_steps: int = MAX_STEPS,
+) -> np.ndarray:
+    """
+    각 드론을 할당된 목표까지 **유클리드 직선**으로 등속 보간 이동시킨다.
+
+    시각화용·모핑 데모에 적합하다. 격자 기반 ``compute_timeline_hungarian`` 과 달리
+    한 스텝에 임의의 실수 좌표가 되며, **충돌은 고려하지 않는다** (경로가 겹칠 수 있음).
+
+    Parameters
+    ----------
+    drones, targets, assignment : ``compute_timeline_hungarian`` 과 동일
+    max_steps : 보간 구간 수 (t=0 … max_steps-1, 끝에서 목표에 도달)
+    """
+    n = len(drones)
+    frames = np.zeros((max_steps, n, 2), dtype=float)
+    starts = drones.astype(float)
+    goals = np.stack([targets[assignment[i]] for i in range(n)])
+
+    if max_steps <= 1:
+        frames[0] = starts
+        return frames
+
+    for t in range(max_steps):
+        alpha = t / (max_steps - 1)
+        frames[t] = (1.0 - alpha) * starts + alpha * goals
+
+    return frames
+
+
+def pad_timeline_hold(
+    frames: np.ndarray,
+    hold_start: int = 0,
+    hold_end: int = 0,
+) -> np.ndarray:
+    """앞·뒤에 정지 구간(마지막/첫 프레임 복제)을 붙인다."""
+    parts: List[np.ndarray] = []
+    if hold_start > 0:
+        parts.append(np.repeat(frames[:1], hold_start, axis=0))
+    parts.append(frames)
+    if hold_end > 0:
+        parts.append(np.repeat(frames[-1:], hold_end, axis=0))
+    return np.concatenate(parts, axis=0)
+
+
 def detect_collisions(
     frames: np.ndarray,
     t: int,

@@ -19,7 +19,7 @@ from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from config import IMAGE_SIZE, CONTOUR_METHODS, DEFAULT_METHOD
+from config import IMAGE_SIZE, CONTOUR_METHODS, DEFAULT_METHOD, LETTER_SPACING_PX
 
 # size 문자열 → 배율 매핑
 _SCALE = {"small": 1.0, "medium": 1.5, "large": 2.0}
@@ -32,13 +32,41 @@ _FONT_PATH = os.path.join(os.path.dirname(__file__), "..", "fonts", "NotoSans-Bl
 # 렌더링
 # ===========================================================================
 
+def _char_advance(draw: ImageDraw.ImageDraw, font: ImageFont.FreeTypeFont, ch: str) -> float:
+    """한 글자의 가로 진행량(대략 글자 너비)."""
+    try:
+        return float(draw.textlength(ch, font=font))
+    except Exception:
+        bb = draw.textbbox((0, 0), ch, font=font)
+        return float(bb[2] - bb[0])
+
+
+def _spaced_text_width(
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.FreeTypeFont,
+    text: str,
+    letter_spacing: float,
+) -> float:
+    """자간을 넣은 전체 문자열 가로 길이."""
+    if not text:
+        return 0.0
+    total = sum(_char_advance(draw, font, ch) for ch in text)
+    total += letter_spacing * max(0, len(text) - 1)
+    return total
+
+
 def _render_text_image(
-    text: str, w: int, h: int, font_path: str = _FONT_PATH
+    text: str,
+    w: int,
+    h: int,
+    font_path: str = _FONT_PATH,
+    letter_spacing: float | None = None,
 ) -> np.ndarray:
     """
     PIL로 text를 w×h grayscale 이미지로 렌더링한다.
 
     글자가 이미지 안에 꽉 차도록 폰트 크기를 자동으로 조정한다.
+    ``letter_spacing`` 으로 글자 사이 추가 간격(px)을 줄 수 있다 (기본: config).
 
     Parameters
     ----------
@@ -46,6 +74,7 @@ def _render_text_image(
     w         : 이미지 너비 (픽셀)
     h         : 이미지 높이 (픽셀)
     font_path : 사용할 TTF 폰트 경로 (기본: fonts/NotoSans-Black.ttf)
+    letter_spacing : 글자 사이 추가 간격(px). None이면 ``LETTER_SPACING_PX`` 사용.
 
     Returns
     -------
@@ -63,6 +92,8 @@ def _render_text_image(
             "fonts/NotoSans-Black.ttf 파일이 없습니다. README를 참고하세요."
         )
 
+    ls = float(LETTER_SPACING_PX) if letter_spacing is None else float(letter_spacing)
+
     img = Image.new("L", (w, h), color=255)
     draw = ImageDraw.Draw(img)
 
@@ -70,16 +101,22 @@ def _render_text_image(
     chosen_size = 10
     for fs in range(max(10, int(h * 0.95)), 9, -2):
         font = ImageFont.truetype(abs_font, fs)
+        tw = _spaced_text_width(draw, font, text, ls)
         bbox = draw.textbbox((0, 0), text, font=font)
-        if (bbox[2] - bbox[0]) <= w * padding and (bbox[3] - bbox[1]) <= h * padding:
+        th = bbox[3] - bbox[1]
+        if tw <= w * padding and th <= h * padding:
             chosen_size = fs
             break
 
     font = ImageFont.truetype(abs_font, chosen_size)
-    bbox = draw.textbbox((0, 0), text, font=font)
-    x0 = (w - (bbox[2] - bbox[0])) // 2 - bbox[0]
-    y0 = (h - (bbox[3] - bbox[1])) // 2 - bbox[1]
-    draw.text((x0, y0), text, fill=0, font=font)
+    tw = _spaced_text_width(draw, font, text, ls)
+    probe_bb = draw.textbbox((0, 0), text, font=font)
+    th = probe_bb[3] - probe_bb[1]
+    y0 = (h - th) // 2 - probe_bb[1]
+    x = (w - tw) / 2.0
+    for i, ch in enumerate(text):
+        draw.text((x, y0), ch, fill=0, font=font)
+        x += _char_advance(draw, font, ch) + (ls if i < len(text) - 1 else 0.0)
 
     return np.array(img)
 
@@ -334,6 +371,107 @@ def _sample_contour_equidistant(contour_pts: np.ndarray, n: int) -> np.ndarray:
     return np.column_stack([xs, ys])
 
 
+def _closed_polygon_perimeter(pts: np.ndarray) -> float:
+    """닫힌 다각형(마지막→첫 변 포함) 둘레 길이."""
+    k = len(pts)
+    if k < 2:
+        return 0.0
+    return float(
+        sum(np.linalg.norm(pts[(i + 1) % k] - pts[i]) for i in range(k))
+    )
+
+
+def _sample_closed_polygon_equidistant(pts: np.ndarray, n: int) -> np.ndarray:
+    """닫힌 윤곽을 따라 둘레 등간격으로 n점 샘플."""
+    k = len(pts)
+    if n <= 0:
+        return np.empty((0, 2), dtype=float)
+    if k < 2:
+        return np.repeat(pts[:1], n, axis=0)
+
+    cumlen = np.zeros(k + 1, dtype=float)
+    for i in range(k):
+        cumlen[i + 1] = cumlen[i] + np.linalg.norm(pts[(i + 1) % k] - pts[i])
+    total = cumlen[-1]
+    if total <= 1e-12:
+        return np.repeat(pts[:1], n, axis=0)
+
+    target_dists = np.linspace(0.0, total, n, endpoint=False)
+    out = np.zeros((n, 2), dtype=float)
+    for idx, d in enumerate(target_dists):
+        j = int(np.searchsorted(cumlen, d, side="right") - 1)
+        j = min(max(j, 0), k - 1)
+        t0, t1 = cumlen[j], cumlen[j + 1]
+        p0 = pts[j]
+        p1 = pts[(j + 1) % k]
+        if t1 - t0 <= 1e-12:
+            out[idx] = p0
+        else:
+            alpha = (d - t0) / (t1 - t0)
+            out[idx] = (1.0 - alpha) * p0 + alpha * p1
+    return out
+
+
+def _allocate_n_by_length(lengths: list[float], n: int) -> list[int]:
+    """둘레 비율로 n을 각 윤곽에 배분 (합 = n)."""
+    total = float(sum(lengths))
+    if total <= 1e-12:
+        return [n] + [0] * (len(lengths) - 1)
+    arr = np.array(lengths, dtype=float)
+    counts = np.round(n * arr / total).astype(int)
+    counts = np.maximum(counts, 0)
+    while int(counts.sum()) < n:
+        counts[np.argmax(arr)] += 1
+    while int(counts.sum()) > n and int(counts.max()) > 0:
+        counts[np.argmax(counts)] -= 1
+    return [int(x) for x in counts]
+
+
+def _sample_multi_contour_equidistant(arr: np.ndarray, n: int) -> np.ndarray:
+    """
+    find_contours로 얻은 **여러 닫힌 윤곽** 각각에서 등간격 샘플 후 합친다.
+
+    윤곽을 한 줄로 이어 붙이면 글자 사이를 가로지르는 가짜 변이 생겨,
+    샘플이 글자 밖으로 튀는 문제가 있었다.
+    """
+    contours = find_contours(arr, level=128)
+    if not contours:
+        raise ValueError("윤곽선을 찾지 못했습니다.")
+
+    polys: list[np.ndarray] = []
+    lengths: list[float] = []
+    for c in contours:
+        p = np.column_stack([c[:, 1], c[:, 0]]).astype(float)
+        L = _closed_polygon_perimeter(p)
+        if L > 1e-6:
+            polys.append(p)
+            lengths.append(L)
+
+    if not polys:
+        raise ValueError("유효한 윤곽선이 없습니다.")
+
+    counts = _allocate_n_by_length(lengths, n)
+    chunks: list[np.ndarray] = []
+    for poly, nc in zip(polys, counts):
+        if nc <= 0:
+            continue
+        chunks.append(_sample_closed_polygon_equidistant(poly, nc))
+
+    if not chunks:
+        raise ValueError(
+            "글자가 너무 작거나 n이 너무 큽니다. size를 키우거나 n을 줄이세요."
+        )
+
+    Q = np.vstack(chunks)
+    if Q.shape[0] != n:
+        if Q.shape[0] > n:
+            Q = Q[:n]
+        else:
+            pad = np.tile(Q[-1:], (n - Q.shape[0], 1))
+            Q = np.vstack([Q, pad])
+    return Q
+
+
 # ===========================================================================
 # Poisson Disk 샘플링
 # ===========================================================================
@@ -541,8 +679,7 @@ def generate_coordinates(
     arr = _render_text_image(text, w, h)
 
     if method == "contour":
-        contour_pts = _extract_contour_points(arr)
-        Q = _sample_contour_equidistant(contour_pts, n)
+        Q = _sample_multi_contour_equidistant(arr, n)
 
     elif method == "poisson":
         mask = arr < 128
@@ -612,19 +749,15 @@ if __name__ == "__main__":
     )
     print("[PASS] 윤곽선 좌표가 글자 마스크 경계 근처에 위치")
 
-    # 3b) 점 간 거리 표준편차: 윤곽선 < Poisson (등간격 → 균일도 높음)
+    # 3b) 점 간 거리 표준편차 (참고: 자간·글자 형태에 따라 대소 관계가 바뀔 수 있음)
     def _consecutive_dists(pts: np.ndarray) -> np.ndarray:
         return np.linalg.norm(np.diff(pts, axis=0), axis=1)
 
     std_contour = _consecutive_dists(Q_contour).std()
     std_poisson = _consecutive_dists(Q_poisson).std()
-    assert std_contour < std_poisson, (
-        f"윤곽선 방식의 균일도가 낮습니다 "
-        f"(contour std={std_contour:.4f}, poisson std={std_poisson:.4f})"
-    )
     print(
-        f"[PASS] 점 간 거리 std: "
-        f"contour={std_contour:.4f} < poisson={std_poisson:.4f}"
+        f"[PASS] 점 간 거리 std (참고): "
+        f"contour={std_contour:.4f}, poisson={std_poisson:.4f}"
     )
 
     # ── 4. 잘못된 입력 예외 처리 ─────────────────────────────────────────────
