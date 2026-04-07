@@ -23,7 +23,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from config import MIN_SAFE_DIST, MAX_STEPS
+from config import COLLISION_RESOLUTION_MAX_PASSES, MIN_SAFE_DIST, MAX_STEPS
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +102,43 @@ def compute_timeline_hungarian(
             frames[t, i] = frames[t - 1, i] + np.sign(diff)
 
     return frames
+
+
+def compute_timeline_linear(
+    drones: np.ndarray,
+    targets: np.ndarray,
+    assignment: np.ndarray,
+    max_steps: int = MAX_STEPS,
+) -> np.ndarray:
+    """
+    할당된 목표까지 유클리드 직선으로 등속 보간 (충돌 미고려, 시각화용).
+    """
+    n = len(drones)
+    frames = np.zeros((max_steps, n, 2), dtype=float)
+    starts = drones.astype(float)
+    goals = np.stack([targets[assignment[i]] for i in range(n)])
+    if max_steps <= 1:
+        frames[0] = starts
+        return frames
+    for t in range(max_steps):
+        alpha = t / (max_steps - 1)
+        frames[t] = (1.0 - alpha) * starts + alpha * goals
+    return frames
+
+
+def pad_timeline_hold(
+    frames: np.ndarray,
+    hold_start: int = 0,
+    hold_end: int = 0,
+) -> np.ndarray:
+    """앞·뒤에 정지 구간(프레임 복제)을 붙인다."""
+    parts: List[np.ndarray] = []
+    if hold_start > 0:
+        parts.append(np.repeat(frames[:1], hold_start, axis=0))
+    parts.append(frames)
+    if hold_end > 0:
+        parts.append(np.repeat(frames[-1:], hold_end, axis=0))
+    return np.concatenate(parts, axis=0)
 
 
 def detect_collisions(
@@ -242,11 +279,13 @@ def run_collision_resolution(
     assignment: np.ndarray,
     targets: np.ndarray,
     min_dist: float = MIN_SAFE_DIST,
+    max_passes: int = COLLISION_RESOLUTION_MAX_PASSES,
 ) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """
     전체 타임라인에 대해 detect_collisions → resolve_collisions 를 순차적으로 실행한다.
 
-    각 스텝을 오름차순으로 처리하며, 이전 스텝의 해결 결과가 이후 스텝에 자동 반영된다.
+    한 번의 스캔(0→T-1)만으로 해결되지 않는 경우가 있어, **여러 패스**를 반복한다.
+    (한 패스에서 해결한 내용이 다른 시각에 새 충돌을 만들 수 있음.)
 
     Parameters
     ----------
@@ -254,6 +293,7 @@ def run_collision_resolution(
     assignment : ndarray (n,)              — hungarian_assign 결과
     targets    : ndarray (n, 2)            — 목표 좌표 (충돌 해결 시 재경로화에 사용)
     min_dist   : 충돌 판정 거리 기준 (기본값 MIN_SAFE_DIST)
+    max_passes : 타임라인 전체 스캔 반복 상한 (기본 `config.COLLISION_RESOLUTION_MAX_PASSES`)
 
     Returns
     -------
@@ -262,50 +302,61 @@ def run_collision_resolution(
     stats 구조
     ~~~~~~~~~~
     {
-        'total_detected'      : int,       # 누적 감지된 충돌 쌍 수
-        'per_step'            : {t: int},  # 스텝별 감지 충돌 쌍 수
-        'steps_with_collision': int,       # 충돌 발생 스텝 수
-        'remaining'           : int,       # 해결 후 잔여 충돌 쌍 수 (누적)
+        'total_detected'      : int,   # 모든 패스에서 처리한 충돌 쌍 횟수(누적)
+        'per_step'            : dict,  # 스텝별 감지 충돌 쌍 수 (마지막 패스 기준)
+        'steps_with_collision': int,   # 첫 패스에서 충돌이 있었던 서로 다른 t 수
+        'remaining'           : int,   # 최종 잔여 충돌 쌍 수 (전체 스캔)
+        'passes_used'         : int,   # 실제 반복한 스캔 횟수
     }
 
-    Example
-    -------
-    # frames, assignment, stats = run_collision_resolution(frames, assignment, targets)
-    # print(f"감지: {stats['total_detected']}, 잔여: {stats['remaining']}")
-    # resolution_rate = 1 - stats['remaining'] / max(stats['total_detected'], 1)
+    Note
+    ----
+    완전 무충돌을 수학적으로 보장하지는 않는다. 잔여는 ``stats['remaining']`` 으로 확인.
     """
-    max_steps  = frames.shape[0]
-    frames     = frames.copy()
+    max_steps = frames.shape[0]
+    frames = frames.copy()
     assignment = assignment.copy()
 
     per_step: Dict[int, int] = {}
     steps_with_collision = 0
     total_detected = 0
+    passes_used = 0
+    first_pass_collision_ts: set[int] = set()
 
-    for t in range(max_steps):
-        collisions = detect_collisions(frames, t, min_dist)
-        if not collisions:
-            continue
+    for _ in range(max_passes):
+        passes_used += 1
+        any_this_pass = False
+        for t in range(max_steps):
+            collisions = detect_collisions(frames, t, min_dist)
+            if not collisions:
+                continue
+            any_this_pass = True
+            cnt = len(collisions)
+            total_detected += cnt
+            if passes_used == 1 and t not in first_pass_collision_ts:
+                first_pass_collision_ts.add(t)
+                steps_with_collision += 1
 
-        cnt = len(collisions)
-        total_detected       += cnt
-        per_step[t]           = cnt
-        steps_with_collision += 1
+            frames, assignment = resolve_collisions(frames, assignment, targets, collisions, t)
 
-        frames, assignment = resolve_collisions(frames, assignment, targets, collisions, t)
+        if not any_this_pass:
+            break
 
-    # ── 잔여 충돌 집계 ────────────────────────────────────────────────────
-    # resolve 는 t+1 이후만 수정할 수 있으므로, 중간 t에서 재확인하면 항상 0%가 나온다.
-    # 루프 완료 후 최종 frames 전체를 재스캔해야 의미 있는 해결률을 얻을 수 있다.
     remaining = sum(
         len(detect_collisions(frames, t, min_dist)) for t in range(max_steps)
     )
+
+    for t in range(max_steps):
+        c = detect_collisions(frames, t, min_dist)
+        if c:
+            per_step[t] = len(c)
 
     stats: Dict = {
         "total_detected": total_detected,
         "per_step": per_step,
         "steps_with_collision": steps_with_collision,
         "remaining": remaining,
+        "passes_used": passes_used,
     }
 
     return frames, assignment, stats
@@ -421,7 +472,11 @@ if __name__ == "__main__":
     assert f_res.shape == f10.shape
     assert a_res.shape == asgn10.shape
     assert set(stats.keys()) == {
-        "total_detected", "per_step", "steps_with_collision", "remaining"
+        "total_detected",
+        "per_step",
+        "steps_with_collision",
+        "remaining",
+        "passes_used",
     }
     # remaining 은 최종 frames 전체 재스캔 결과이므로 total_detected 와 단순 대소 비교 불가
 
@@ -440,11 +495,12 @@ if __name__ == "__main__":
     print(f"       감지: {stats['total_detected']}쌍, "
           f"잔여: {stats['remaining']}쌍, "
           f"해결률: {resolution_rate:.1%}, "
-          f"충돌 발생 스텝: {stats['steps_with_collision']}")
+          f"충돌 발생 스텝: {stats['steps_with_collision']}, "
+          f"패스: {stats['passes_used']}")
 
-    # 9) stats['per_step'] 합계 == total_detected
-    assert sum(stats["per_step"].values()) == stats["total_detected"]
-    print("[PASS] per_step 합계 == total_detected")
+    # 9) 최종 스캔 기준 per_step 합계 == remaining
+    assert sum(stats["per_step"].values()) == stats["remaining"]
+    print("[PASS] per_step 합계 == remaining (최종 스캔)")
 
     # 10) 입력 배열 불변성 (run_collision_resolution이 복사본 사용)
     f10_backup   = f10.copy()

@@ -5,6 +5,8 @@
 
 MIN_SAFE_DIST = 2.0          # 드론 간 최소 안전 거리
 MAX_STEPS = 200              # 최대 타임스텝
+# run_collision_resolution: 타임라인 0→T-1 스캔을 최대 몇 번 반복할지 (잔여 충돌 감소)
+COLLISION_RESOLUTION_MAX_PASSES = 25
 DRONE_COUNTS = [20, 50, 100]
 STRINGS = ["AL", "LOVE", "KENTECH"]
 SIZES = ["small", "medium", "large"]

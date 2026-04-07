@@ -15,7 +15,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from config import MAX_STEPS, MIN_SAFE_DIST
+from config import COLLISION_RESOLUTION_MAX_PASSES, MAX_STEPS, MIN_SAFE_DIST
 
 from .hungarian import build_cost_matrix, hungarian_assign
 from .timeline import compute_timeline_hungarian, run_collision_resolution
@@ -45,6 +45,7 @@ def greedy_timeline_then_resolve(
     max_steps: int = MAX_STEPS,
     min_dist: float = MIN_SAFE_DIST,
     frames_raw: Optional[np.ndarray] = None,
+    max_passes: int = COLLISION_RESOLUTION_MAX_PASSES,
 ) -> Tuple[np.ndarray, np.ndarray, Dict, np.ndarray]:
     """
     그리디(sign) 타임라인 생성 후 충돌 회피를 적용한다.
@@ -59,6 +60,10 @@ def greedy_timeline_then_resolve(
             drones, targets, assignment, max_steps=max_steps
         )
     frames, assignment, stats = run_collision_resolution(
-        frames_raw, assignment, targets, min_dist=min_dist
+        frames_raw,
+        assignment,
+        targets,
+        min_dist=min_dist,
+        max_passes=max_passes,
     )
     return frames, assignment, stats, frames_raw
