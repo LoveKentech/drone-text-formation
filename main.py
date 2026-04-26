@@ -18,7 +18,7 @@ from src.hungarian_collision import (
     hungarian_assignment,
 )
 from src.timeline import compute_timeline_hungarian, detect_collisions
-from src.cbs import cbs_assign
+from src.cbs import cbs_assign, detect_conflict
 from src.visualize import animate, compare_animate
 
 
@@ -64,6 +64,35 @@ def _compute_dist_metrics(frames: np.ndarray):
     step_dists  = np.linalg.norm(diffs, axis=2)     # (T-1, n)
     drone_dists = step_dists.sum(axis=0)            # (n,)
     return float(drone_dists.sum()), float(drone_dists.max())
+
+
+def _all_reached_goal(
+    frames: np.ndarray,
+    targets: np.ndarray,
+    assignment: np.ndarray,
+    tol: float = 1e-6,
+) -> bool:
+    """
+    마지막 프레임에서 모든 드론이 할당 목표에 도달했는지 검사한다.
+
+    CBS는 목표를 정수 격자로 반올림해 계획하므로, 도달 판정도 동일한 정수 목표 기준으로
+    수행해 정합성을 맞춘다.
+    """
+    n = frames.shape[1]
+    final_pos = frames[-1]
+    goal_pos = np.stack(
+        [
+            np.array(
+                [
+                    float(int(round(targets[assignment[i]][0]))),
+                    float(int(round(targets[assignment[i]][1]))),
+                ]
+            )
+            for i in range(n)
+        ],
+        axis=0,
+    )
+    return bool(np.all(np.linalg.norm(final_pos - goal_pos, axis=1) <= tol))
 
 
 def _make_drones(targets: np.ndarray, n: int, text: str, size: str) -> np.ndarray:
@@ -127,7 +156,8 @@ def run_experiment(text: str, n: int, size: str, algorithm: str) -> Dict:
         assign_time = time.perf_counter() - t0
 
         if paths is not None:
-            frames = _paths_to_frames(paths, n, MAX_STEPS)
+            cbs_horizon = max((len(p) for p in paths.values()), default=MAX_STEPS)
+            frames = _paths_to_frames(paths, n, cbs_horizon)
         else:
             print(
                 f"  [WARN] CBS 탐색 실패 — Hungarian+resolve 폴백 "
@@ -175,12 +205,14 @@ def save_results(
 # 애니메이션 저장
 # ---------------------------------------------------------------------------
 
-def _save_animations(text: str = "LOVE", n: int = 50, size: str = "medium") -> None:
-    """대표 케이스(n=50, LOVE, medium) 애니메이션 3종을 output/에 저장한다."""
+def _save_animations(text: str = "KENTECH", n: int = 200, size: str = "medium") -> None:
+    """대표 케이스 애니메이션 3종을 output/에 저장하고 충돌 통계를 출력한다."""
     os.makedirs("output", exist_ok=True)
 
     targets    = generate_coordinates(text, n, size)
-    drones     = _make_drones(targets, n, text, size)
+    # drones     = _make_drones(targets, n, text, size)
+    drones    = generate_coordinates("LOVE", n, size)
+
     _, assignment = hungarian_assignment(drones, targets)
 
     # Hungarian 프레임
@@ -189,18 +221,40 @@ def _save_animations(text: str = "LOVE", n: int = 50, size: str = "medium") -> N
         drones, targets, assignment, frames_raw=frames_h_raw
     )
     frames_h = _trim_frames(frames_h)
+    collision_before = _count_all_collisions(frames_h_raw)
+    h_collision_after = _count_all_collisions(frames_h)
 
-    # CBS 프레임
+    # CBS 프레임 + 상태 판정
     paths = cbs_assign(drones, targets, assignment, max_steps=MAX_STEPS)
     if paths is not None:
-        frames_c = _trim_frames(_paths_to_frames(paths, n, MAX_STEPS))
+        cbs_horizon = max((len(p) for p in paths.values()), default=MAX_STEPS)
+        frames_c_raw = _paths_to_frames(paths, n, cbs_horizon)
+        reached = _all_reached_goal(frames_c_raw, targets, assignment)
+        has_mapf_conflict = detect_conflict(paths) is not None
+
+        if reached and not has_mapf_conflict:
+            cbs_status = "SUCCESS"
+            frames_c = _trim_frames(frames_c_raw)
+        elif reached and has_mapf_conflict:
+            cbs_status = "PARTIAL_CONFLICT"
+            frames_c = frames_c_raw
+        else:
+            cbs_status = "PARTIAL_UNREACHED"
+            frames_c = frames_c_raw
     else:
         print(f"[WARN] 대표 케이스 CBS 실패 — Hungarian 결과로 대체")
+        cbs_status = "FALLBACK_HUNGARIAN"
         frames_c = frames_h
+    c_collision_after = _count_all_collisions(frames_c)
 
-    h_path = f"output/hungarian_{text}_{n}.gif"
-    c_path = f"output/cbs_{text}_{n}.gif"
-    cmp_path = f"output/compare_{text}_{n}.gif"
+    print(
+        f"[충돌] Hungarian {collision_before}->{h_collision_after} | "
+        f"CBS {collision_before}->{c_collision_after} ({cbs_status})"
+    )
+
+    h_path = f"output/hungarian_{text}_{n}_{size}.gif"
+    c_path = f"output/cbs_{text}_{n}_{size}_{cbs_status}.gif"
+    cmp_path = f"output/compare_{text}_{n}_{size}_{cbs_status}.gif"
 
     print(f"[GIF] {h_path}")
     animate(frames_h, targets,
@@ -209,13 +263,13 @@ def _save_animations(text: str = "LOVE", n: int = 50, size: str = "medium") -> N
 
     print(f"[GIF] {c_path}")
     animate(frames_c, targets,
-            title=f"CBS | {text} | n={n} | {size}",
+            title=f"CBS | {text} | n={n} | {size} | {cbs_status}",
             save_path=c_path)
 
     print(f"[GIF] {cmp_path}")
     compare_animate(frames_h, frames_c, targets, save_path=cmp_path)
 
-    print("[GIF] 저장 완료")
+    print(f"[GIF] 저장 완료 (CBS 상태: {cbs_status})")
 
 
 # ---------------------------------------------------------------------------
@@ -223,36 +277,36 @@ def _save_animations(text: str = "LOVE", n: int = 50, size: str = "medium") -> N
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("드론 텍스트 포메이션 실험 시작")
-    print("=" * 60)
+    # print("=" * 60)
+    # print("드론 텍스트 포메이션 실험 시작")
+    # print("=" * 60)
 
-    results: List[Dict] = []
-    algorithms = ["hungarian", "cbs"]
-    total = len(algorithms) * len(DRONE_COUNTS) * len(STRINGS) * len(SIZES)
-    idx = 0
+    # results: List[Dict] = []
+    # algorithms = ["hungarian", "cbs"]
+    # total = len(algorithms) * len(DRONE_COUNTS) * len(STRINGS) * len(SIZES)
+    # idx = 0
 
-    for algorithm in algorithms:
-        for n in DRONE_COUNTS:
-            for text in STRINGS:
-                for size in SIZES:
-                    idx += 1
-                    print(
-                        f"[{idx:>3}/{total}] {algorithm:10s} | "
-                        f"n={n:>3} | {text:>7} | {size}"
-                    )
-                    result = run_experiment(text, n, size, algorithm)
-                    results.append(result)
-                    print(
-                        f"         총거리={result['total_dist']:.1f}  "
-                        f"충돌 {result['collision_before']}→{result['collision_after']}  "
-                        f"배정={result['assign_time']:.3f}s  "
-                        f"전체={result['total_time']:.2f}s"
-                    )
+    # for algorithm in algorithms:
+    #     for n in DRONE_COUNTS:
+    #         for text in STRINGS:
+    #             for size in SIZES:
+    #                 idx += 1
+    #                 print(
+    #                     f"[{idx:>3}/{total}] {algorithm:10s} | "
+    #                     f"n={n:>3} | {text:>7} | {size}"
+    #                 )
+    #                 result = run_experiment(text, n, size, algorithm)
+    #                 results.append(result)
+    #                 print(
+    #                     f"         총거리={result['total_dist']:.1f}  "
+    #                     f"충돌 {result['collision_before']}→{result['collision_after']}  "
+    #                     f"배정={result['assign_time']:.3f}s  "
+    #                     f"전체={result['total_time']:.2f}s"
+    #                 )
 
-    save_results(results, "results/experiment.csv")
+    # save_results(results, "results/experiment.csv")
 
-    print("\n[애니메이션] 대표 케이스 (n=50, LOVE, medium) 생성 중 ...")
-    _save_animations(text="LOVE", n=50, size="medium")
+    print("\n[애니메이션] 대표 케이스 (n=200, KENTECH, medium) 생성 중 ...")
+    _save_animations(text="KENTECH", n=200, size="medium")
 
     print("\n실험 완료.")

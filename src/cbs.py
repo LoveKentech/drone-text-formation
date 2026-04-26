@@ -8,13 +8,14 @@ High-Level : 충돌 발견 시 제약 조건 트리를 분기하며 best-first(�
 Low-Level  : 각 드론마다 astar_with_constraints로 단일 경로를 재계획.
 
 탐색 공간  : (x, y, t) — 2D 위치 + 시각의 3차원 격자.
-이동 모델  : 8방향(상하좌우+대각) + 제자리 대기(wait), 총 9가지 액션.
+이동 모델  : 기본 4방향 + 대기(논문 정합), 옵션으로 8방향 + 대기 지원.
 """
 
 import heapq
 import itertools
 import os
 import sys
+from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 import numpy as np
@@ -22,16 +23,33 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import MAX_STEPS
 
-# 8방향 이동 + 제자리 대기 (dx=0, dy=0)
-_MOVES: List[Tuple[int, int]] = [
+# 4방향 + 대기 (논문 기본 MAPF 실험 정합)
+_MOVES_4N_WAIT: List[Tuple[int, int]] = [
+    (1, 0),
+    (-1, 0),
+    (0, 1),
+    (0, -1),
+    (0, 0),
+]
+
+# 8방향 + 대기 (기존 동작 호환 옵션)
+_MOVES_8N_WAIT: List[Tuple[int, int]] = [
     (dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
 ]
 
 # 타입 별칭
 Pos        = Tuple[int, int]
 Constraint = Tuple[int, int, int]   # (x, y, t)
+EdgeConstraint = Tuple[int, int, int, int, int]  # (x1, y1, x2, y2, t)
 Path       = List[Pos]
 PathsDict  = Dict[int, Path]
+
+
+@dataclass(frozen=True)
+class AgentConstraints:
+    """개별 agent에 적용되는 CBS 제약."""
+    vertex: FrozenSet[Constraint]
+    edge: FrozenSet[EdgeConstraint]
 
 
 # ---------------------------------------------------------------------------
@@ -41,15 +59,20 @@ PathsDict  = Dict[int, Path]
 def astar_with_constraints(
     start: Pos,
     goal: Pos,
-    constraints: Set[Constraint],
+    vertex_constraints: Set[Constraint],
+    edge_constraints: Set[EdgeConstraint],
     max_steps: int,
+    grid_bounds: Tuple[int, int, int, int],
+    blocked_cells: Set[Pos],
+    moves: List[Tuple[int, int]],
 ) -> Optional[Path]:
     """
     제약 조건을 피하며 start → goal 최단 경로를 (x, y, t) 3차원 A*로 탐색한다.
 
     핵심 규칙
     ---------
-    - 제약 조건 (x, y, t) : 시각 t에 위치 (x, y) 점유 불가.
+    - Vertex 제약 (x, y, t) : 시각 t에 위치 (x, y) 점유 불가.
+    - Edge 제약 (x1, y1, x2, y2, t) : t→t+1 사이 directed edge 통과 금지.
     - 목표 점유 제약 처리 : 드론이 goal에 도착한 뒤 제자리 대기(패딩)가 충돌로
       이어질 수 있으므로, goal에 대한 제약 중 가장 늦은 시각(latest_goal_constraint)
       보다 '이후'에 도착해야만 경로를 확정한다.
@@ -59,8 +82,9 @@ def astar_with_constraints(
     ----------
     start       : (x, y) 출발 위치 (정수 좌표)
     goal        : (x, y) 목표 위치 (정수 좌표)
-    constraints : {(x, y, t), ...} — 이 드론에게 금지된 (위치, 시각) 집합
-    max_steps   : 탐색 깊이 한계 (이 시각 이후 노드는 확장하지 않음)
+    vertex_constraints : {(x, y, t), ...}
+    edge_constraints   : {(x1, y1, x2, y2, t), ...}
+    max_steps          : 탐색 깊이 한계 (이 시각 이후 노드는 확장하지 않음)
 
     Returns
     -------
@@ -76,9 +100,19 @@ def astar_with_constraints(
 
     # goal에 걸린 제약 중 가장 늦은 시각 → 그 이후에 도착해야 안전
     latest_goal_constraint: int = max(
-        (t for (x, y, t) in constraints if x == gx and y == gy),
+        (t for (x, y, t) in vertex_constraints if x == gx and y == gy),
         default=-1,
     )
+
+    min_x, max_x, min_y, max_y = grid_bounds
+    if not (min_x <= sx <= max_x and min_y <= sy <= max_y):
+        return None
+    if not (min_x <= gx <= max_x and min_y <= gy <= max_y):
+        return None
+    if (sx, sy) in blocked_cells or (gx, gy) in blocked_cells:
+        return None
+    if (sx, sy, 0) in vertex_constraints:
+        return None
 
     def h(x: int, y: int) -> int:
         return max(abs(x - gx), abs(y - gy))  # Chebyshev distance
@@ -114,9 +148,15 @@ def astar_with_constraints(
             continue
 
         # 인접 노드 확장
-        for dx, dy in _MOVES:
+        for dx, dy in moves:
             nx, ny, nt = x + dx, y + dy, t + 1
-            if (nx, ny, nt) in constraints:
+            if not (min_x <= nx <= max_x and min_y <= ny <= max_y):
+                continue
+            if (nx, ny) in blocked_cells:
+                continue
+            if (nx, ny, nt) in vertex_constraints:
+                continue
+            if (x, y, nx, ny, t) in edge_constraints:
                 continue
             new_g = g + 1
             new_state = (nx, ny, nt)
@@ -157,8 +197,9 @@ def detect_conflict(paths: PathsDict) -> Optional[dict]:
     {
         'type'   : 'vertex' | 'edge',
         'agents' : (i, j),           # 충돌 드론 쌍
-        'pos'    : (x, y),           # vertex: 충돌 위치 / edge: 드론 i의 t+1 위치
-        'pos_j'  : (x, y) | None,    # edge only: 드론 j의 t+1 위치
+        'pos'    : (x, y),           # vertex 충돌 위치
+        'move_i' : ((x1,y1),(x2,y2)) | None, # edge only: 드론 i의 이동 (t->t+1)
+        'move_j' : ((x1,y1),(x2,y2)) | None, # edge only: 드론 j의 이동 (t->t+1)
         't'      : int,              # vertex: 충돌 시각 / edge: 교차 시작 시각
     }
 
@@ -192,7 +233,8 @@ def detect_conflict(paths: PathsDict) -> Optional[dict]:
                     "type": "vertex",
                     "agents": (pos_owner[pos], aid),
                     "pos": pos,
-                    "pos_j": None,
+                    "move_i": None,
+                    "move_j": None,
                     "t": t,
                 }
             pos_owner[pos] = aid
@@ -209,8 +251,9 @@ def detect_conflict(paths: PathsDict) -> Optional[dict]:
                         return {
                             "type": "edge",
                             "agents": (ai, aj),
-                            "pos":   pi_t1,  # 드론 i의 t+1 위치
-                            "pos_j": pj_t1,  # 드론 j의 t+1 위치
+                            "pos": None,
+                            "move_i": (pi_t, pi_t1),
+                            "move_j": (pj_t, pj_t1),
                             "t": t,
                         }
 
@@ -226,6 +269,11 @@ def cbs_assign(
     targets: np.ndarray,
     assignment: np.ndarray,
     max_steps: int = MAX_STEPS,
+    grid_margin: int = 5,
+    strict_cbs: bool = True,
+    max_iterations: Optional[int] = None,
+    move_model: str = "4n",
+    blocked_cells: Optional[Set[Pos]] = None,
 ) -> Optional[PathsDict]:
     """
     CBS(Conflict-Based Search)로 드론 전체의 충돌 없는 경로를 탐색한다.
@@ -239,7 +287,7 @@ def cbs_assign(
           두 자식 노드를 큐에 삽입.
     3. 반복 횟수 초과 or 큐 소진 → None 반환.
 
-    제약 조건 형식 : frozenset of (x, y, t)  (드론별로 독립 관리)
+    제약 조건 형식 : agent별 {vertex, edge}를 독립 관리
 
     Parameters
     ----------
@@ -277,32 +325,83 @@ def cbs_assign(
         for i in range(n)
     ]
 
+    # ── 유한 격자 경계 구성 (논문형 G(V,E)에서 V를 bounded grid로 근사) ─────
+    all_x = [p[0] for p in starts] + [p[0] for p in goals]
+    all_y = [p[1] for p in starts] + [p[1] for p in goals]
+    min_x = min(all_x) - grid_margin
+    max_x = max(all_x) + grid_margin
+    min_y = min(all_y) - grid_margin
+    max_y = max(all_y) + grid_margin
+    grid_bounds = (min_x, max_x, min_y, max_y)
+    blocked = blocked_cells or set()
+
+    if move_model == "4n":
+        moves = _MOVES_4N_WAIT
+    elif move_model == "8n":
+        moves = _MOVES_8N_WAIT
+    else:
+        raise ValueError("move_model must be one of {'4n', '8n'}")
+
+    # ── 동적 탐색 깊이 설정 ────────────────────────────────────────────────
+    # 기본 max_steps가 너무 작아 해가 잘리는 경우를 줄이기 위해,
+    # 시작-목표 하한 거리의 최댓값에 여유분(slack)을 더해 최소 필요 깊이를 보장한다.
+    if move_model == "4n":
+        lb_per_agent = [
+            abs(starts[i][0] - goals[i][0]) + abs(starts[i][1] - goals[i][1])
+            for i in range(n)
+        ]  # Manhattan lower bound
+    else:
+        lb_per_agent = [
+            max(abs(starts[i][0] - goals[i][0]), abs(starts[i][1] - goals[i][1]))
+            for i in range(n)
+        ]  # Chebyshev lower bound
+
+    required_steps = max(lb_per_agent) if lb_per_agent else 0
+    slack_steps = 40
+    effective_max_steps = max(max_steps, required_steps + slack_steps)
+
     # ── 초기 경로 계획 (제약 없음) ────────────────────────────────────────
     init_paths: PathsDict = {}
     for i in range(n):
-        path = astar_with_constraints(starts[i], goals[i], set(), max_steps)
+        path = astar_with_constraints(
+            starts[i],
+            goals[i],
+            set(),
+            set(),
+            effective_max_steps,
+            grid_bounds,
+            blocked,
+            moves,
+        )
         if path is None:
             return None  # 기본 경로조차 없으면 즉시 실패
         init_paths[i] = path
 
     def total_cost(paths: PathsDict) -> int:
         """Sum-of-Costs : 모든 드론 경로 길이의 합."""
-        return sum(len(p) for p in paths.values())
+        return sum(max(0, len(p) - 1) for p in paths.values())
 
     # ── CBS 우선순위 큐 초기화 ────────────────────────────────────────────
     # 힙 원소: (cost, tiebreak_id, constraints_dict, paths_dict)
     # constraints_dict : {drone_id: frozenset of (x, y, t)}
     counter = itertools.count()
-    init_constraints: Dict[int, FrozenSet[Constraint]] = {
-        i: frozenset() for i in range(n)
+    init_constraints: Dict[int, AgentConstraints] = {
+        i: AgentConstraints(vertex=frozenset(), edge=frozenset()) for i in range(n)
     }
     open_list: list = [
         (total_cost(init_paths), next(counter), init_constraints, init_paths)
     ]
 
-    max_iterations = 2_000  # CBS 고수준 탐색 반복 상한
+    if strict_cbs:
+        max_loops = None
+    else:
+        max_loops = 2_000 if max_iterations is None else max_iterations
 
-    for _ in range(max_iterations):
+    loops = 0
+    while True:
+        if max_loops is not None and loops >= max_loops:
+            return None
+        loops += 1
         if not open_list:
             return None
 
@@ -321,21 +420,39 @@ def cbs_assign(
                 # vertex : 해당 위치·시각을 금지
                 cx, cy = conflict["pos"]
                 ct = conflict["t"]
+                add_vertex = (cx, cy, ct)
+                add_edge = None
             else:
-                # edge   : 교차 이동 시 agent가 t+1에 진입하는 위치를 금지
-                pos = conflict["pos"] if agent == ai else conflict["pos_j"]
-                cx, cy = pos
-                ct = conflict["t"] + 1
+                # edge : 해당 시각의 directed edge 통과 금지 (논문 정합)
+                move = conflict["move_i"] if agent == ai else conflict["move_j"]
+                (x1, y1), (x2, y2) = move
+                ct = conflict["t"]
+                add_vertex = None
+                add_edge = (x1, y1, x2, y2, ct)
 
             new_constraints = dict(constraints)
-            new_constraints[agent] = constraints[agent] | frozenset([(cx, cy, ct)])
+            prev = constraints[agent]
+            if add_vertex is not None:
+                new_constraints[agent] = AgentConstraints(
+                    vertex=prev.vertex | frozenset([add_vertex]),
+                    edge=prev.edge,
+                )
+            else:
+                new_constraints[agent] = AgentConstraints(
+                    vertex=prev.vertex,
+                    edge=prev.edge | frozenset([add_edge]),
+                )
 
             # 해당 드론만 재계획
             new_path = astar_with_constraints(
                 starts[agent],
                 goals[agent],
-                set(new_constraints[agent]),
-                max_steps,
+                set(new_constraints[agent].vertex),
+                set(new_constraints[agent].edge),
+                effective_max_steps,
+                grid_bounds,
+                blocked,
+                moves,
             )
             if new_path is None:
                 continue  # 이 브랜치는 해 없음 → 스킵
@@ -348,7 +465,7 @@ def cbs_assign(
                 (total_cost(new_paths), next(counter), new_constraints, new_paths),
             )
 
-    return None  # 반복 상한 초과
+    return None  # strict=False에서 반복 상한 초과 시 도달
 
 
 # ---------------------------------------------------------------------------
@@ -364,20 +481,29 @@ if __name__ == "__main__":
     print("=== astar_with_constraints 단위 테스트 ===\n")
 
     # 1) 기본 경로 탐색
-    path = astar_with_constraints((0, 0), (5, 5), set(), max_steps=50)
+    path = astar_with_constraints(
+        (0, 0), (5, 5), set(), set(), max_steps=50,
+        grid_bounds=(-20, 20, -20, 20), blocked_cells=set(), moves=_MOVES_8N_WAIT
+    )
     assert path is not None and path[0] == (0, 0) and path[-1] == (5, 5)
     assert len(path) == 6  # Chebyshev 거리 5 → 6 스텝(start 포함)
     print("[PASS] (0,0)→(5,5) 최단 경로 길이 = 6")
 
     # 2) start == goal
-    path_trivial = astar_with_constraints((3, 3), (3, 3), set(), max_steps=20)
+    path_trivial = astar_with_constraints(
+        (3, 3), (3, 3), set(), set(), max_steps=20,
+        grid_bounds=(-20, 20, -20, 20), blocked_cells=set(), moves=_MOVES_8N_WAIT
+    )
     assert path_trivial == [(3, 3)]
     print("[PASS] start == goal → [(3,3)]")
 
     # 3) 제약 조건 회피
     #    (2, 0) ~ (2, 2) 를 t=1~3 에 막으면 우회해야 함
     blocked = {(2, y, t) for y in range(-1, 3) for t in range(1, 6)}
-    path_detour = astar_with_constraints((0, 0), (4, 0), blocked, max_steps=30)
+    path_detour = astar_with_constraints(
+        (0, 0), (4, 0), blocked, set(), max_steps=30,
+        grid_bounds=(-20, 20, -20, 20), blocked_cells=set(), moves=_MOVES_8N_WAIT
+    )
     assert path_detour is not None and path_detour[-1] == (4, 0)
     for pos, t in zip(path_detour, range(len(path_detour))):
         assert (pos[0], pos[1], t) not in blocked, f"제약 위반: {pos} at t={t}"
@@ -385,7 +511,10 @@ if __name__ == "__main__":
 
     # 4) 불가능한 경로 → None
     impossible = {(x, y, t) for x in range(-5, 10) for y in range(-5, 10) for t in range(1, 30)}
-    path_none = astar_with_constraints((0, 0), (5, 5), impossible, max_steps=20)
+    path_none = astar_with_constraints(
+        (0, 0), (5, 5), impossible, set(), max_steps=20,
+        grid_bounds=(-20, 20, -20, 20), blocked_cells=set(), moves=_MOVES_8N_WAIT
+    )
     assert path_none is None
     print("[PASS] 탈출 불가 제약 → None 반환")
 
