@@ -24,8 +24,15 @@ from config import IMAGE_SIZE, CONTOUR_METHODS, DEFAULT_METHOD
 # size 문자열 → 배율 매핑
 _SCALE = {"small": 1.0, "medium": 1.5, "large": 2.0}
 
-# 프로젝트 내 폰트 경로
-_FONT_PATH = os.path.join(os.path.dirname(__file__), "..", "fonts", "NotoSans-Black.ttf")
+# 프로젝트 내 폰트 경로 (Noto Sans variable font — 모든 weight 포함)
+_FONT_PATH = os.path.join(os.path.dirname(__file__), "..", "fonts", "NotoSans-VF.ttf")
+
+# Variable font에서 선택 가능한 weight (가는 순 → 굵은 순)
+FONT_WEIGHTS = [
+    "Thin", "ExtraLight", "Light", "Regular", "Medium",
+    "SemiBold", "Bold", "ExtraBold", "Black",
+]
+DEFAULT_WEIGHT = "Black"  # 기존 동작 호환을 위한 기본값
 
 
 # ===========================================================================
@@ -33,19 +40,25 @@ _FONT_PATH = os.path.join(os.path.dirname(__file__), "..", "fonts", "NotoSans-Bl
 # ===========================================================================
 
 def _render_text_image(
-    text: str, w: int, h: int, font_path: str = _FONT_PATH
+    text: str,
+    w: int,
+    h: int,
+    weight: str = DEFAULT_WEIGHT,
+    font_path: str = _FONT_PATH,
 ) -> np.ndarray:
     """
     PIL로 text를 w×h grayscale 이미지로 렌더링한다.
 
     글자가 이미지 안에 꽉 차도록 폰트 크기를 자동으로 조정한다.
+    Variable font의 named instance를 통해 weight를 선택한다.
 
     Parameters
     ----------
     text      : 렌더링할 문자열
     w         : 이미지 너비 (픽셀)
     h         : 이미지 높이 (픽셀)
-    font_path : 사용할 TTF 폰트 경로 (기본: fonts/NotoSans-Black.ttf)
+    weight    : 폰트 굵기 — FONT_WEIGHTS 중 하나 (기본: "Black")
+    font_path : 사용할 TTF 폰트 경로 (기본: fonts/NotoSans-VF.ttf)
 
     Returns
     -------
@@ -54,13 +67,20 @@ def _render_text_image(
 
     Raises
     ------
+    ValueError
+        weight가 FONT_WEIGHTS에 없을 때.
     FileNotFoundError
         폰트 파일이 존재하지 않을 때.
     """
+    if weight not in FONT_WEIGHTS:
+        raise ValueError(
+            f"weight는 {FONT_WEIGHTS} 중 하나여야 합니다. 입력값: {weight!r}"
+        )
+
     abs_font = os.path.abspath(font_path)
     if not os.path.isfile(abs_font):
         raise FileNotFoundError(
-            "fonts/NotoSans-Black.ttf 파일이 없습니다. README를 참고하세요."
+            f"{abs_font} 파일이 없습니다. README를 참고하세요."
         )
 
     img = Image.new("L", (w, h), color=255)
@@ -70,12 +90,14 @@ def _render_text_image(
     chosen_size = 10
     for fs in range(max(10, int(h * 0.95)), 9, -2):
         font = ImageFont.truetype(abs_font, fs)
+        font.set_variation_by_name(weight)
         bbox = draw.textbbox((0, 0), text, font=font)
         if (bbox[2] - bbox[0]) <= w * padding and (bbox[3] - bbox[1]) <= h * padding:
             chosen_size = fs
             break
 
     font = ImageFont.truetype(abs_font, chosen_size)
+    font.set_variation_by_name(weight)
     bbox = draw.textbbox((0, 0), text, font=font)
     x0 = (w - (bbox[2] - bbox[0])) // 2 - bbox[0]
     y0 = (h - (bbox[3] - bbox[1])) // 2 - bbox[1]
@@ -448,7 +470,12 @@ def _sample_poisson_disk(mask: np.ndarray, n: int) -> np.ndarray:
 # 공개 API
 # ===========================================================================
 
-def compute_optimal_n(text: str, size: str, coverage: float = 0.9) -> int:
+def compute_optimal_n(
+    text: str,
+    size: str,
+    coverage: float = 0.9,
+    weight: str = DEFAULT_WEIGHT,
+) -> int:
     """
     텍스트를 표현하는 데 필요한 최적 드론 수를 계산한다.
 
@@ -461,6 +488,7 @@ def compute_optimal_n(text: str, size: str, coverage: float = 0.9) -> int:
     text     : 렌더링할 문자열
     size     : 이미지 배율 — "small" / "medium" / "large"
     coverage : 목표 커버리지 비율 (기본값 0.9)
+    weight   : 폰트 굵기 — FONT_WEIGHTS 중 하나 (기본: "Black")
 
     Returns
     -------
@@ -470,7 +498,7 @@ def compute_optimal_n(text: str, size: str, coverage: float = 0.9) -> int:
     Raises
     ------
     ValueError
-        size가 유효하지 않을 때.
+        size 또는 weight가 유효하지 않을 때.
     FileNotFoundError
         폰트 파일이 없을 때.
     """
@@ -483,7 +511,7 @@ def compute_optimal_n(text: str, size: str, coverage: float = 0.9) -> int:
     w = int(IMAGE_SIZE[0] * scale)
     h = int(IMAGE_SIZE[1] * scale)
 
-    arr = _render_text_image(text, w, h)
+    arr = _render_text_image(text, w, h, weight=weight)
     mask = arr < 128
 
     if mask.sum() == 0:
@@ -494,11 +522,41 @@ def compute_optimal_n(text: str, size: str, coverage: float = 0.9) -> int:
     return max(len(pts), 1)
 
 
+def render_text_image(
+    text: str, size: str, weight: str = DEFAULT_WEIGHT
+) -> np.ndarray:
+    """
+    generate_coordinates와 동일한 조건으로 래스터화한 텍스트 이미지를 반환한다.
+
+    visualize.py의 배경 이미지로 사용하면 드론 목표 좌표와 픽셀 단위로 정렬된다.
+
+    Parameters
+    ----------
+    text   : 렌더링할 문자열
+    size   : 이미지 배율 — "small" / "medium" / "large"
+    weight : 폰트 굵기 — FONT_WEIGHTS 중 하나 (기본: "Black")
+
+    Returns
+    -------
+    np.ndarray, shape (h, w)
+        글자=0(검정), 배경=255(흰색).
+    """
+    if size not in _SCALE:
+        raise ValueError(
+            f"size는 {list(_SCALE.keys())} 중 하나여야 합니다. 입력값: {size!r}"
+        )
+    scale = _SCALE[size]
+    w = int(IMAGE_SIZE[0] * scale)
+    h = int(IMAGE_SIZE[1] * scale)
+    return _render_text_image(text, w, h, weight=weight)
+
+
 def generate_coordinates(
     text: str,
     n: int | None,
     size: str,
     method: str = DEFAULT_METHOD,
+    weight: str = DEFAULT_WEIGHT,
 ) -> np.ndarray:
     """
     텍스트를 이미지로 렌더링한 뒤 지정된 방식으로 n개의 드론 목표 좌표를 반환한다.
@@ -509,6 +567,7 @@ def generate_coordinates(
     n      : 목표 좌표 수. None이면 compute_optimal_n으로 자동 결정.
     size   : 이미지 배율 — "small"(×1.0) / "medium"(×1.5) / "large"(×2.0)
     method : 샘플링 방식 — "contour"(기본값) / "poisson" / "grid"
+    weight : 폰트 굵기 — FONT_WEIGHTS 중 하나 (기본: "Black")
 
     Returns
     -------
@@ -518,9 +577,9 @@ def generate_coordinates(
     Raises
     ------
     ValueError
-        size / method가 유효하지 않거나 점 수가 부족할 때.
+        size / method / weight가 유효하지 않거나 점 수가 부족할 때.
     FileNotFoundError
-        fonts/NotoSans-Black.ttf 파일이 없을 때.
+        fonts/NotoSans-VF.ttf 파일이 없을 때.
     """
     if size not in _SCALE:
         raise ValueError(
@@ -532,13 +591,13 @@ def generate_coordinates(
         )
 
     if n is None:
-        n = compute_optimal_n(text, size)
+        n = compute_optimal_n(text, size, weight=weight)
 
     scale = _SCALE[size]
     w = int(IMAGE_SIZE[0] * scale)
     h = int(IMAGE_SIZE[1] * scale)
 
-    arr = _render_text_image(text, w, h)
+    arr = _render_text_image(text, w, h, weight=weight)
 
     if method == "contour":
         contour_pts = _extract_contour_points(arr)
@@ -588,7 +647,7 @@ if __name__ == "__main__":
         assert Q[:, 1].max() < IMAGE_SIZE[1], f"[{mth}] y 좌표가 이미지 높이 초과"
     print("[PASS] 좌표 범위 이미지 크기 이내")
 
-    # ── 3. 윤곽선 방식 특성 검증 ─────────────────────────────────────────────
+    # ── 3. 윤곽선 방식 특성 검증(poisson, contour 방식)─────────────────────────────────────────────
     _txt, _sz, _n = "LOVE", "medium", DRONE_COUNTS[1]
     _w = int(IMAGE_SIZE[0] * 1.5)
     _h = int(IMAGE_SIZE[1] * 1.5)

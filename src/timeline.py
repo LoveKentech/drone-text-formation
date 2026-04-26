@@ -64,15 +64,15 @@ def _recompute_from_goal(
 # Public API
 # ---------------------------------------------------------------------------
 
-def compute_timeline_hungarian(
+def compute_timeline_greedy(
     drones: np.ndarray,
     targets: np.ndarray,
     assignment: np.ndarray,
     max_steps: int = MAX_STEPS,
 ) -> np.ndarray:
     """
-    헝가리안 배정 결과를 바탕으로, 매 스텝 각 드론이 목표를 향해
-    np.sign 으로 한 칸(대각선 포함) 이동하는 타임라인을 계산한다.
+    주어진 배정 결과를 바탕으로, 매 스텝 각 드론이 목표를 향해
+    np.sign 으로 한 칸(대각선 포함) 이동하는 그리디 타임라인을 계산한다.
 
     이동 규칙
     ---------
@@ -95,7 +95,7 @@ def compute_timeline_hungarian(
 
     Example
     -------
-    # frames = compute_timeline_hungarian(drones, targets, assignment, max_steps=100)
+    # frames = compute_timeline_greedy(drones, targets, assignment, max_steps=100)
     # assert frames.shape == (100, len(drones), 2)
     # assert np.allclose(frames[0], drones)
     """
@@ -313,7 +313,7 @@ def run_collision_resolution(
 
     Parameters
     ----------
-    frames     : ndarray (max_steps, n, 2) — compute_timeline_hungarian 결과
+    frames     : ndarray (max_steps, n, 2) — compute_timeline_greedy 결과
     assignment : ndarray (n,)              — hungarian_assign 결과
     targets    : ndarray (n, 2)            — 목표 좌표 (충돌 해결 시 재경로화에 사용)
     min_dist   : 충돌 판정 거리 기준 (기본값 MIN_SAFE_DIST)
@@ -440,7 +440,7 @@ def smooth_timeline_separation(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("=== compute_timeline_hungarian 단위 테스트 ===\n")
+    print("=== compute_timeline_greedy 단위 테스트 ===\n")
 
     # 1) 출력 shape 확인
     n, ms = 5, 30
@@ -449,7 +449,7 @@ if __name__ == "__main__":
     tgt = np.array([[8.0, 8.0], [2.0, 2.0], [8.0, 2.0],
                     [2.0, 8.0], [0.0, 0.0]])
     asgn = np.arange(n)
-    frames = compute_timeline_hungarian(d, tgt, asgn, max_steps=ms)
+    frames = compute_timeline_greedy(d, tgt, asgn, max_steps=ms)
     assert frames.shape == (ms, n, 2), f"shape 오류: {frames.shape}"
     assert np.allclose(frames[0], d), "t=0이 초기 위치와 다름"
     print("[PASS] shape (max_steps, n, 2) 및 frames[0] == drones")
@@ -457,7 +457,7 @@ if __name__ == "__main__":
     # 2) 단일 드론 (0,0) → (5,5): 5스텝에 도달
     d1   = np.array([[0.0, 0.0]])
     tgt1 = np.array([[5.0, 5.0]])
-    f1   = compute_timeline_hungarian(d1, tgt1, np.array([0]), max_steps=20)
+    f1   = compute_timeline_greedy(d1, tgt1, np.array([0]), max_steps=20)
     assert np.allclose(f1[5, 0], [5.0, 5.0]), f"t=5 위치 오류: {f1[5,0]}"
     assert np.allclose(f1[10, 0], [5.0, 5.0]), "도달 후 정지 안 됨"
     print("[PASS] (0,0)→(5,5) 5스텝 도달 및 이후 정지")
@@ -503,7 +503,7 @@ if __name__ == "__main__":
     d_ho   = np.array([[0.0, 0.0], [8.0, 0.0]])
     tgt_ho = np.array([[8.0, 0.0], [0.0, 0.0]])
     a_ho   = np.array([0, 1])
-    f_ho   = compute_timeline_hungarian(d_ho, tgt_ho, a_ho, max_steps=30)
+    f_ho   = compute_timeline_greedy(d_ho, tgt_ho, a_ho, max_steps=30)
 
     cols_ho = detect_collisions(f_ho, t=4, min_dist=MIN_SAFE_DIST)
     assert cols_ho, "t=4에서 head-on 충돌이 감지되어야 함"
@@ -537,7 +537,7 @@ if __name__ == "__main__":
     from hungarian import build_cost_matrix, hungarian_assign
 
     asgn10 = hungarian_assign(build_cost_matrix(d10, t10))
-    f10    = compute_timeline_hungarian(d10, t10, asgn10, max_steps=80)
+    f10    = compute_timeline_greedy(d10, t10, asgn10, max_steps=80)
 
     f_res, a_res, stats = run_collision_resolution(f10, asgn10, t10, min_dist=MIN_SAFE_DIST)
 

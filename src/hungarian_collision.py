@@ -19,19 +19,19 @@ from config import COLLISION_RESOLUTION_MAX_PASSES, MAX_STEPS, MIN_SAFE_DIST
 
 from .hungarian import build_cost_matrix, hungarian_assign
 from .timeline import (
-    compute_timeline_hungarian,
+    compute_timeline_greedy,
     detect_collisions,
     run_collision_resolution,
     smooth_timeline_separation,
 )
 
 
-def hungarian_assignment(
+def compute_assignment(
     drones: np.ndarray,
     targets: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    드론–목표 1:1 최소 총거리 배정.
+    드론–목표 1:1 최소 총거리 배정 (헝가리안 알고리즘 사용).
 
     Returns
     -------
@@ -65,7 +65,7 @@ def greedy_timeline_then_resolve(
         ``stats['remaining']``(스무딩 후 재계산)을 보면 된다.
     """
     if frames_raw is None:
-        frames_raw = compute_timeline_hungarian(
+        frames_raw = compute_timeline_greedy(
             drones, targets, assignment, max_steps=max_steps
         )
     frames, assignment, stats = run_collision_resolution(

@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from config import CONTOUR_METHODS, DEFAULT_METHOD
 from src.coordinate import generate_coordinates
-from src.hungarian_collision import greedy_timeline_then_resolve, hungarian_assignment
+from src.hungarian_collision import compute_assignment, greedy_timeline_then_resolve
 from src.timeline import compute_timeline_linear, pad_timeline_hold
 from src.visualize import animate_morph
 
@@ -57,7 +57,7 @@ def main() -> None:
     pos_start = generate_coordinates(args.start, args.n, args.size, method=args.method)
     pos_end = generate_coordinates(args.end, args.n, args.size, method=args.method)
     drones = pos_start.astype(float)
-    _, assignment = hungarian_assignment(drones, pos_end)
+    _, assignment = compute_assignment(drones, pos_end)
 
     if args.mode == "resolve":
         frames, _, stats, _ = greedy_timeline_then_resolve(

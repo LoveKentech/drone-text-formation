@@ -28,8 +28,8 @@ from src.experiment_record import (
     trial_id,
     write_manifest,
 )
-from src.hungarian_collision import greedy_timeline_then_resolve, hungarian_assignment
-from src.timeline import compute_timeline_hungarian, detect_collisions
+from src.hungarian_collision import compute_assignment, greedy_timeline_then_resolve
+from src.timeline import compute_timeline_greedy, detect_collisions
 from src.cbs import cbs_assign
 from src.visualize import animate, compare_animate
 
@@ -93,10 +93,10 @@ def run_experiment(
     targets = generate_coordinates(EXPERIMENT_END_TEXT, n, size)
 
     t0 = time.perf_counter()
-    _, assignment = hungarian_assignment(drones, targets)
+    _, assignment = compute_assignment(drones, targets)
     hungarian_time = time.perf_counter() - t0
 
-    frames_raw = compute_timeline_hungarian(
+    frames_raw = compute_timeline_greedy(
         drones, targets, assignment, max_steps=max_steps
     )
     collision_before_raw = _count_all_collisions(frames_raw, min_dist=min_safe_dist)
@@ -206,9 +206,9 @@ def _save_animations(
 
     drones  = generate_coordinates(EXPERIMENT_START_TEXT, n, size)
     targets = generate_coordinates(EXPERIMENT_END_TEXT, n, size)
-    _, assignment = hungarian_assignment(drones, targets)
+    _, assignment = compute_assignment(drones, targets)
 
-    frames_raw = compute_timeline_hungarian(
+    frames_raw = compute_timeline_greedy(
         drones, targets, assignment, max_steps=MAX_STEPS
     )
     frames_resolved, assignment, stats, _ = greedy_timeline_then_resolve(
