@@ -3,10 +3,16 @@
 matplotlib을 사용해 드론 이동 궤적 애니메이션을 생성하고 output/에 저장한다.
 """
 
+import os
+import sys
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from typing import Optional, Tuple
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import MORPH_DRONE_SCATTER_S
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +53,7 @@ def animate(
     targets: np.ndarray,
     title: str,
     save_path: Optional[str] = None,
-    show_targets: bool = True,
+    show_targets: bool = False,
 ) -> animation.FuncAnimation:
     """
     사전 계산된 frames를 순서대로 재생하는 애니메이션을 생성한다.
@@ -128,7 +134,7 @@ def animate_morph(
     save_path: Optional[str] = None,
     interval_ms: int = 35,
     draw_start_cloud: bool = False,
-    drone_size: float = 36.0,
+    drone_size: float = MORPH_DRONE_SCATTER_S,
 ) -> animation.FuncAnimation:
     """
     LOVE→HELLO 등 모핑: 목표 마커 없이 드론만 애니메이션.
@@ -196,6 +202,7 @@ def compare_animate(
     frames_cbs: np.ndarray,
     targets: np.ndarray,
     save_path: Optional[str] = None,
+    show_targets: bool = False,
 ) -> animation.FuncAnimation:
     """
     Hungarian과 CBS 두 알고리즘 결과를 나란히 subplot으로 비교한다.
@@ -226,11 +233,12 @@ def compare_animate(
     _setup_ax(ax_h, frames_hungarian, targets, "Hungarian")
     _setup_ax(ax_c, frames_cbs,       targets, "CBS")
 
-    for ax in (ax_h, ax_c):
-        ax.scatter(
-            targets[:, 0], targets[:, 1],
-            c="red", marker="x", s=60, linewidths=1.5, zorder=2,
-        )
+    if show_targets:
+        for ax in (ax_h, ax_c):
+            ax.scatter(
+                targets[:, 0], targets[:, 1],
+                c="red", marker="x", s=60, linewidths=1.5, zorder=2,
+            )
 
     sc_h = ax_h.scatter(
         frames_hungarian[0, :, 0], frames_hungarian[0, :, 1],
