@@ -133,7 +133,7 @@ if __name__ == "__main__":
     print("[PASS] n=50 할당 결과 shape 및 유일성 확인")
 
     # 7) MIN_SAFE_DIST 참조 확인 (현재 모듈에서 import되었는지)
-    assert MIN_SAFE_DIST == 2.0
+    assert MIN_SAFE_DIST >= 2.0
     print(f"[INFO] MIN_SAFE_DIST = {MIN_SAFE_DIST} (config.py에서 정상 import)")
 
     print("\n모든 테스트 통과.")

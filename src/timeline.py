@@ -23,7 +23,15 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from config import COLLISION_RESOLUTION_MAX_PASSES, MIN_SAFE_DIST, MAX_STEPS
+from config import (
+    COLLISION_RESOLUTION_MAX_PASSES,
+    DETOUR_TIE_EPS,
+    MIN_SAFE_DIST,
+    MAX_STEPS,
+    TRAJECTORY_SEPARATION_PASSES_PER_ITER,
+    TRAJECTORY_SMOOTH_BLEND,
+    TRAJECTORY_SMOOTH_OUTER_ITERS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -250,16 +258,32 @@ def resolve_collisions(
         goal_b = targets[assignment[b]]
         next_pos_a = frames[t + 1, a]
 
-        best_pos  = None
-        best_dist = float("inf")
+        candidates: List[Tuple[np.ndarray, float]] = []
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 cand = pos_b + np.array([dx, dy], dtype=float)
                 if np.linalg.norm(cand - next_pos_a) >= MIN_SAFE_DIST:
-                    d = np.linalg.norm(cand - goal_b)
-                    if d < best_dist:
-                        best_dist = d
-                        best_pos  = cand
+                    d_goal = np.linalg.norm(cand - goal_b)
+                    candidates.append((cand, d_goal))
+
+        best_pos = None
+        if candidates:
+            min_d = min(d for _, d in candidates)
+            near = [(c, d) for c, d in candidates if d <= min_d + DETOUR_TIE_EPS]
+            if len(near) == 1:
+                best_pos = near[0][0]
+            else:
+                prev_vel = pos_b - frames[t - 1, b] if t > 0 else np.zeros(2)
+                pv_norm = np.linalg.norm(prev_vel)
+
+                def _align(cand: np.ndarray) -> float:
+                    step_v = cand - pos_b
+                    sv = np.linalg.norm(step_v)
+                    if pv_norm < 1e-9 or sv < 1e-9:
+                        return 0.0
+                    return float(np.dot(step_v, prev_vel) / (sv * pv_norm))
+
+                best_pos = max(near, key=lambda x: _align(x[0]))[0]
 
         # 현재 위치와 같으면(wait와 동일) strategy 3으로 넘김
         if best_pos is not None and not np.allclose(best_pos, pos_b):
@@ -360,6 +384,55 @@ def run_collision_resolution(
     }
 
     return frames, assignment, stats
+
+
+def smooth_timeline_separation(
+    frames: np.ndarray,
+    min_dist: float,
+    blend: float | None = None,
+    outer_iters: int | None = None,
+) -> np.ndarray:
+    """
+    충돌 회피가 끝난 타임라인을 시각적으로 부드럽게 한다.
+
+    각 시각에서 인접 프레임 평균으로 살짝 스무딩한 뒤, 같은 시각의 드론 쌍이
+    min_dist 미만이면 반씩 밀어낸다. 이를 반복해 지그재그·떨림을 줄이면서
+    거리 제약을 유지하려 한다(완전 보장은 아니며, 남은 충돌은 detect로 확인).
+    """
+    if blend is None:
+        blend = TRAJECTORY_SMOOTH_BLEND
+    if outer_iters is None:
+        outer_iters = TRAJECTORY_SMOOTH_OUTER_ITERS
+
+    out = np.asarray(frames, dtype=float).copy()
+    T, n, _ = out.shape
+    if T < 3 or n < 2:
+        return out
+
+    sp = TRAJECTORY_SEPARATION_PASSES_PER_ITER
+    for _ in range(outer_iters):
+        sm = out.copy()
+        for t in range(1, T - 1):
+            sm[t] = (1.0 - blend) * out[t] + 0.5 * blend * (out[t - 1] + out[t + 1])
+        sm[0] = out[0]
+        sm[-1] = out[-1]
+        out = sm
+        for __ in range(sp):
+            for t in range(T):
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        p = out[t, i] - out[t, j]
+                        dist = float(np.linalg.norm(p))
+                        if dist >= min_dist or dist < 1e-15:
+                            continue
+                        half = 0.5 * (min_dist - dist)
+                        if dist < 1e-12:
+                            d = np.array([1.0, 0.0], dtype=float)
+                        else:
+                            d = p / dist
+                        out[t, i] += half * d
+                        out[t, j] -= half * d
+    return out
 
 
 # ---------------------------------------------------------------------------
