@@ -65,8 +65,6 @@ def _compute_dist_metrics(frames: np.ndarray):
     step_dists  = np.linalg.norm(diffs, axis=2)
     drone_dists = step_dists.sum(axis=0)
     return float(drone_dists.sum()), float(drone_dists.max())
-
-
 # ---------------------------------------------------------------------------
 # 핵심 실험 함수
 # ---------------------------------------------------------------------------
@@ -196,7 +194,6 @@ def run_experiment(
 # 애니메이션 저장
 # ---------------------------------------------------------------------------
 
-
 def _save_animations(
     n: int = 200,
     size: str = "medium",
@@ -274,7 +271,7 @@ def _save_animations(
             show_targets=False,
         )
 
-    print("[GIF] 저장 완료")
+    print(f"[GIF] 저장 완료 (include_cbs={include_cbs})")
 
 
 # ---------------------------------------------------------------------------
