@@ -35,13 +35,20 @@ EXPERIMENT_REPRESENTATIVE_SIZE = "large"
 # 전체 실험 후 GIF로 저장할 대표 케이스. 모든 trial GIF 저장은 시간/용량이 커서 하지 않는다.
 EXPERIMENT_GIF_CASES = [
     ("LOVE", "KENTECH", 200, "large"),
+    # AL 관련 size 효과 확인용: 같은 n=100에서 small/medium/large 비교
+    ("AL", "KENTECH", 100, "small"),
+    ("AL", "KENTECH", 100, "medium"),
+    ("AL", "KENTECH", 100, "large"),
+    ("KENTECH", "AL", 100, "small"),
+    ("KENTECH", "AL", 100, "medium"),
+    ("KENTECH", "AL", 100, "large"),
 ]
 # CBS 내부 정수 격자 해상도 배율 (1=기존, 2 이상이면 더 촘촘한 격자)
 CBS_GRID_SCALE = 2
 # 200대 이상에서는 CBS 탐색 트리가 급격히 커질 수 있어 상한 내 실패로 기록한다.
 CBS_MAX_ITERATIONS = 100000
 # CBS가 이 시간 안에 해를 못 찾으면 실패로 기록한다. Hungarian 폴백은 사용하지 않는다.
-CBS_TIMEOUT_SEC = 60.0
+CBS_TIMEOUT_SEC = 200.0
 IMAGE_SIZE = (200, 100)      # 렌더링 이미지 크기
 
 CONTOUR_METHODS = ["contour", "poisson", "grid"]   # 좌표 샘플링 방식

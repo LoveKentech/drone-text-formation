@@ -39,7 +39,7 @@ from src.experiment_record import (
 )
 from src.hungarian_collision import compute_assignment, greedy_timeline_then_resolve
 from src.timeline import compute_timeline_greedy, detect_collisions
-from src.cbs import cbs_assign, detect_conflict as detect_cbs_conflict
+from src.cbs import cbs_assign
 from src.visualize import animate, compare_animate
 
 
@@ -318,6 +318,107 @@ def _count_all_collisions(frames: np.ndarray, min_dist: float = MIN_SAFE_DIST) -
     )
 
 
+def _count_cbs_grid_conflicts(frames: np.ndarray, grid_scale: int) -> Dict[str, object]:
+    """CBS 격자 MAPF 기준 vertex/edge 충돌 이벤트를 센다."""
+    cells = np.rint(np.asarray(frames, dtype=float) * grid_scale).astype(int)
+    T, n, _ = cells.shape
+    vertex_conflicts = 0
+    edge_conflicts = 0
+    conflict_timesteps: set[int] = set()
+    first_type = ""
+    first_t: object = ""
+    first_agents = ""
+
+    for t in range(T):
+        pos_agents: Dict[tuple[int, int], List[int]] = {}
+        for aid in range(n):
+            pos = (int(cells[t, aid, 0]), int(cells[t, aid, 1]))
+            pos_agents.setdefault(pos, []).append(aid)
+
+        for agents in pos_agents.values():
+            if len(agents) < 2:
+                continue
+            vertex_conflicts += len(agents) * (len(agents) - 1) // 2
+            conflict_timesteps.add(t)
+            if first_type == "":
+                first_type = "vertex"
+                first_t = t
+                first_agents = f"{agents[0]}-{agents[1]}"
+
+        if t + 1 >= T:
+            continue
+
+        edge_agents: Dict[tuple[tuple[int, int], tuple[int, int]], List[int]] = {}
+        for aid in range(n):
+            src = (int(cells[t, aid, 0]), int(cells[t, aid, 1]))
+            dst = (int(cells[t + 1, aid, 0]), int(cells[t + 1, aid, 1]))
+            if src == dst:
+                continue
+            edge_agents.setdefault((src, dst), []).append(aid)
+
+        seen_edges: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+        for edge, agents in edge_agents.items():
+            if edge in seen_edges:
+                continue
+            src, dst = edge
+            reverse = (dst, src)
+            reverse_agents = edge_agents.get(reverse)
+            if not reverse_agents:
+                continue
+            edge_conflicts += len(agents) * len(reverse_agents)
+            conflict_timesteps.add(t)
+            seen_edges.add(edge)
+            seen_edges.add(reverse)
+            if first_type == "":
+                first_type = "edge"
+                first_t = t
+                first_agents = f"{agents[0]}-{reverse_agents[0]}"
+
+    total = vertex_conflicts + edge_conflicts
+    return {
+        "vertex_conflicts": vertex_conflicts,
+        "edge_conflicts": edge_conflicts,
+        "total_conflicts": total,
+        "timesteps_with_conflict": len(conflict_timesteps),
+        "first_conflict_type": first_type,
+        "first_conflict_t": first_t,
+        "first_conflict_agents": first_agents,
+        "conflict_free": 1 if total == 0 else 0,
+    }
+
+
+def _cbs_grid_stats_for_frames(
+    frames: np.ndarray,
+    *,
+    suffix: str,
+    grid_scale: int,
+) -> Dict[str, object]:
+    stats = _count_cbs_grid_conflicts(frames, grid_scale)
+    return {
+        f"cbs_grid_vertex_conflicts_{suffix}": stats["vertex_conflicts"],
+        f"cbs_grid_edge_conflicts_{suffix}": stats["edge_conflicts"],
+        f"cbs_grid_conflicts_{suffix}": stats["total_conflicts"],
+        f"cbs_grid_timesteps_with_conflict_{suffix}": stats["timesteps_with_conflict"],
+        f"cbs_grid_first_conflict_type_{suffix}": stats["first_conflict_type"],
+        f"cbs_grid_first_conflict_t_{suffix}": stats["first_conflict_t"],
+        f"cbs_grid_first_conflict_agents_{suffix}": stats["first_conflict_agents"],
+        f"cbs_grid_conflict_free_{suffix}": stats["conflict_free"],
+    }
+
+
+def _blank_cbs_grid_after_stats() -> Dict[str, object]:
+    return {
+        "cbs_grid_vertex_conflicts_after": "",
+        "cbs_grid_edge_conflicts_after": "",
+        "cbs_grid_conflicts_after": "",
+        "cbs_grid_timesteps_with_conflict_after": "",
+        "cbs_grid_first_conflict_type_after": "",
+        "cbs_grid_first_conflict_t_after": "",
+        "cbs_grid_first_conflict_agents_after": "",
+        "cbs_grid_conflict_free_after": "",
+    }
+
+
 def _compute_dist_metrics(frames: np.ndarray):
     """(total_dist, max_dist) — 전 드론 이동 거리 합, 단일 드론 최대 이동 거리."""
     diffs       = np.diff(frames, axis=0)
@@ -330,7 +431,10 @@ def _fmt_num(value: object, digits: int = 1) -> str:
     if value == "" or value is None:
         return "NA"
     try:
-        return f"{float(value):.{digits}f}"
+        number = float(value)
+        if np.isnan(number):
+            return "NA"
+        return f"{number:.{digits}f}"
     except (TypeError, ValueError):
         return str(value)
 
@@ -410,9 +514,14 @@ def run_experiment(
         drones, targets, assignment, max_steps=max_steps
     )
     collision_before_raw = _count_all_collisions(frames_raw, min_dist=min_safe_dist)
+    cbs_grid_before_stats = _cbs_grid_stats_for_frames(
+        frames_raw,
+        suffix="before",
+        grid_scale=CBS_GRID_SCALE,
+    )
 
     stats_resolve: Optional[Dict] = None
-    extra_stats: Dict[str, object] = dict(coordinate_stats)
+    extra_stats: Dict[str, object] = {**coordinate_stats, **cbs_grid_before_stats}
     cbs_fallback = False
     cbs_success: Optional[bool] = None
 
@@ -435,6 +544,18 @@ def run_experiment(
             "steps_with_collision": stats.get("steps_with_collision"),
             "remaining": stats.get("remaining"),
         }
+        grid_after_stats = _cbs_grid_stats_for_frames(
+            frames,
+            suffix="after",
+            grid_scale=CBS_GRID_SCALE,
+        )
+        extra_stats.update(grid_after_stats)
+        extra_stats.update({
+            "cbs_grid_conflict_free": grid_after_stats["cbs_grid_conflict_free_after"],
+            "cbs_grid_first_conflict_t": grid_after_stats[
+                "cbs_grid_first_conflict_t_after"
+            ],
+        })
     else:
         precheck_ok, precheck_stats = _cbs_precheck(
             drones,
@@ -470,12 +591,17 @@ def run_experiment(
             frames = _paths_to_frames(paths, n, max_steps)
             collision_before = collision_before_raw
             collision_after = _count_all_collisions(frames, min_dist=min_safe_dist)
-            first_conflict = detect_cbs_conflict(paths)
+            grid_after_stats = _cbs_grid_stats_for_frames(
+                frames,
+                suffix="after",
+                grid_scale=CBS_GRID_SCALE,
+            )
+            extra_stats.update(grid_after_stats)
             extra_stats.update({
-                "cbs_grid_conflict_free": 1 if first_conflict is None else 0,
-                "cbs_grid_first_conflict_t": (
-                    "" if first_conflict is None else first_conflict.get("t", "")
-                ),
+                "cbs_grid_conflict_free": grid_after_stats["cbs_grid_conflict_free_after"],
+                "cbs_grid_first_conflict_t": grid_after_stats[
+                    "cbs_grid_first_conflict_t_after"
+                ],
             })
         else:
             if precheck_ok:
@@ -489,6 +615,7 @@ def run_experiment(
                 "cbs_grid_conflict_free": "",
                 "cbs_grid_first_conflict_t": "",
             })
+            extra_stats.update(_blank_cbs_grid_after_stats())
             pipeline_time = time.perf_counter() - total_start
             reason = (
                 f"precheck_failed: {precheck_stats['cbs_skip_reason']}"
@@ -750,8 +877,10 @@ if __name__ == "__main__":
             print(
                 f"         trial_id={result['trial_id']}  "
                 f"총거리={_fmt_num(result['total_dist'], 1)}  "
-                f"충돌이벤트 {result['collision_pair_events_before']}→"
-                f"{result['collision_pair_events_after']}  "
+                f"거리충돌={_fmt_num(result.get('collision_pair_events_before'), 0)}→"
+                f"{_fmt_num(result.get('collision_pair_events_after'), 0)}  "
+                f"격자충돌={_fmt_num(result.get('cbs_grid_conflicts_before'), 0)}→"
+                f"{_fmt_num(result.get('cbs_grid_conflicts_after'), 0)}  "
                 f"배정={_fmt_num(result['assign_time_sec'], 3)}s  "
                 f"전체={_fmt_num(result['pipeline_time_sec'], 2)}s"
                 f"{cbs_status}"
