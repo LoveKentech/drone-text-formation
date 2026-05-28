@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -67,7 +68,15 @@ def config_snapshot() -> Dict[str, Any]:
         "SIZES",
         "EXPERIMENT_START_TEXT",
         "EXPERIMENT_END_TEXT",
+        "EXPERIMENT_TRANSITIONS",
+        "EXPERIMENT_GIF_CASES",
         "EXPERIMENT_INCLUDE_CBS",
+        "EXPERIMENT_REPRESENTATIVE_ONLY",
+        "EXPERIMENT_REPRESENTATIVE_N",
+        "EXPERIMENT_REPRESENTATIVE_SIZE",
+        "CBS_GRID_SCALE",
+        "CBS_MAX_ITERATIONS",
+        "CBS_TIMEOUT_SEC",
         "IMAGE_SIZE",
         "CONTOUR_METHODS",
         "DEFAULT_METHOD",
@@ -205,6 +214,8 @@ _TRIAL_COLUMN_ORDER = [
     "trial_index",
     "algorithm",
     "n",
+    "start_text",
+    "end_text",
     "text",
     "size",
     "min_safe_dist",
@@ -225,6 +236,41 @@ _TRIAL_COLUMN_ORDER = [
     "is_collision_free",
     "cbs_planner_success",
     "cbs_used_hungarian_fallback",
+    "cbs_failure_reason",
+    "cbs_skipped_by_precheck",
+    "cbs_skip_reason",
+    "cbs_grid_conflict_free",
+    "cbs_grid_first_conflict_t",
+    "cbs_precheck_start_duplicate_cells",
+    "cbs_precheck_start_duplicate_agents",
+    "cbs_precheck_start_max_cell_occupancy",
+    "cbs_precheck_goal_duplicate_cells",
+    "cbs_precheck_goal_duplicate_agents",
+    "cbs_precheck_goal_max_cell_occupancy",
+    "cbs_precheck_initial_close_pair",
+    "cbs_precheck_initial_close_dist",
+    "cbs_precheck_final_close_pair",
+    "cbs_precheck_final_close_dist",
+    "cbs_ready_grid_scale",
+    "cbs_ready_coordinate_adjustment",
+    "start_cbs_ready_reassigned_cells",
+    "start_cbs_ready_duplicate_cells_before",
+    "start_cbs_ready_duplicate_cells_after",
+    "start_cbs_ready_close_pair_before",
+    "start_cbs_ready_close_dist_before",
+    "start_cbs_ready_close_pair_after",
+    "start_cbs_ready_close_dist_after",
+    "start_cbs_ready_mean_adjustment",
+    "start_cbs_ready_max_adjustment",
+    "goal_cbs_ready_reassigned_cells",
+    "goal_cbs_ready_duplicate_cells_before",
+    "goal_cbs_ready_duplicate_cells_after",
+    "goal_cbs_ready_close_pair_before",
+    "goal_cbs_ready_close_dist_before",
+    "goal_cbs_ready_close_pair_after",
+    "goal_cbs_ready_close_dist_after",
+    "goal_cbs_ready_mean_adjustment",
+    "goal_cbs_ready_max_adjustment",
     "resolve_passes_used",
     "resolve_total_detected",
     "resolve_steps_with_collision_first_pass",
@@ -262,7 +308,18 @@ def save_trials_csv(
     hist_path = os.path.join(results_dir, history_filename)
     os.makedirs(os.path.dirname(os.path.abspath(hist_path)) or ".", exist_ok=True)
     if os.path.isfile(hist_path):
-        df.to_csv(hist_path, mode="a", index=False, header=False, encoding="utf-8-sig")
+        try:
+            prev = pd.read_csv(hist_path)
+        except (pd.errors.ParserError, UnicodeDecodeError, ValueError):
+            backup_path = f"{hist_path}.malformed.{run_id}.bak"
+            shutil.copy2(hist_path, backup_path)
+            df.to_csv(hist_path, index=False, encoding="utf-8-sig")
+        else:
+            merged = pd.concat([prev, df], ignore_index=True, sort=False)
+            front = [c for c in _TRIAL_COLUMN_ORDER if c in merged.columns]
+            rest = [c for c in merged.columns if c not in front]
+            merged = merged[front + rest]
+            merged.to_csv(hist_path, index=False, encoding="utf-8-sig")
     else:
         df.to_csv(hist_path, index=False, encoding="utf-8-sig")
 

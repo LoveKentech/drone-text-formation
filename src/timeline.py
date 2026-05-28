@@ -21,6 +21,7 @@ import sys
 from typing import Dict, List, Tuple
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import (
@@ -175,12 +176,21 @@ def detect_collisions(
     """
     positions = frames[t]  # (n, 2)
     n = len(positions)
-    collisions: List[Tuple[int, int]] = []
+    if n < 2 or min_dist <= 0:
+        return []
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            if np.linalg.norm(positions[i] - positions[j]) < min_dist:
-                collisions.append((i, j))
+    tree = cKDTree(positions)
+    candidate_pairs = tree.query_pairs(r=min_dist)
+    if not candidate_pairs:
+        return []
+
+    # query_pairs는 경계값을 포함하므로 기존의 strict '< min_dist' 판정을 유지한다.
+    limit_sq = min_dist * min_dist
+    collisions: List[Tuple[int, int]] = []
+    for i, j in sorted(candidate_pairs):
+        diff = positions[i] - positions[j]
+        if float(np.dot(diff, diff)) < limit_sq:
+            collisions.append((i, j))
 
     return collisions
 
@@ -419,19 +429,19 @@ def smooth_timeline_separation(
         out = sm
         for __ in range(sp):
             for t in range(T):
-                for i in range(n):
-                    for j in range(i + 1, n):
-                        p = out[t, i] - out[t, j]
-                        dist = float(np.linalg.norm(p))
-                        if dist >= min_dist or dist < 1e-15:
-                            continue
-                        half = 0.5 * (min_dist - dist)
-                        if dist < 1e-12:
-                            d = np.array([1.0, 0.0], dtype=float)
-                        else:
-                            d = p / dist
-                        out[t, i] += half * d
-                        out[t, j] -= half * d
+                pairs = cKDTree(out[t]).query_pairs(r=min_dist)
+                for i, j in sorted(pairs):
+                    p = out[t, i] - out[t, j]
+                    dist = float(np.linalg.norm(p))
+                    if dist >= min_dist or dist < 1e-15:
+                        continue
+                    half = 0.5 * (min_dist - dist)
+                    if dist < 1e-12:
+                        d = np.array([1.0, 0.0], dtype=float)
+                    else:
+                        d = p / dist
+                    out[t, i] += half * d
+                    out[t, j] -= half * d
     return out
 
 

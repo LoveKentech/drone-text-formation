@@ -13,8 +13,10 @@ Low-Level  : 각 드론마다 astar_with_constraints로 단일 경로를 재계�
 
 import heapq
 import itertools
+import math
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
@@ -44,6 +46,53 @@ EdgeConstraint = Tuple[int, int, int, int, int]  # (x1, y1, x2, y2, t)
 Path       = List[Pos]
 PathsDict  = Dict[int, Path]
 
+_AXIS_MOVE_COST = 1.0
+_DIAGONAL_MOVE_COST = math.sqrt(2.0)
+
+
+def _move_cost(dx: int, dy: int) -> float:
+    """격자 한 스텝의 연속거리 기반 비용."""
+    if dx == 0 and dy == 0:
+        return _AXIS_MOVE_COST
+    if dx != 0 and dy != 0:
+        return _DIAGONAL_MOVE_COST
+    return _AXIS_MOVE_COST
+
+
+def _path_cost(path: Path) -> float:
+    """경로의 연속거리 기반 누적 비용."""
+    if len(path) < 2:
+        return 0.0
+    return sum(
+        _move_cost(x2 - x1, y2 - y1)
+        for (x1, y1), (x2, y2) in zip(path[:-1], path[1:])
+    )
+
+
+def _direct_unconstrained_path(
+    start: Pos,
+    goal: Pos,
+    moves: List[Tuple[int, int]],
+) -> Path:
+    """제약/장애물이 없을 때 열린 격자에서의 최단 초기 경로."""
+    x, y = start
+    gx, gy = goal
+    path: Path = [(x, y)]
+    allows_diagonal = any(abs(dx) == 1 and abs(dy) == 1 for dx, dy in moves)
+    if allows_diagonal:
+        while (x, y) != (gx, gy):
+            x += int(math.copysign(1, gx - x)) if x != gx else 0
+            y += int(math.copysign(1, gy - y)) if y != gy else 0
+            path.append((x, y))
+    else:
+        while x != gx:
+            x += int(math.copysign(1, gx - x))
+            path.append((x, y))
+        while y != gy:
+            y += int(math.copysign(1, gy - y))
+            path.append((x, y))
+    return path
+
 
 @dataclass(frozen=True)
 class AgentConstraints:
@@ -65,6 +114,7 @@ def astar_with_constraints(
     grid_bounds: Tuple[int, int, int, int],
     blocked_cells: Set[Pos],
     moves: List[Tuple[int, int]],
+    deadline: Optional[float] = None,
 ) -> Optional[Path]:
     """
     제약 조건을 피하며 start → goal 최단 경로를 (x, y, t) 3차원 A*로 탐색한다.
@@ -114,17 +164,28 @@ def astar_with_constraints(
     if (sx, sy, 0) in vertex_constraints:
         return None
 
-    def h(x: int, y: int) -> int:
-        return max(abs(x - gx), abs(y - gy))  # Chebyshev distance
+    allows_diagonal = any(abs(dx) == 1 and abs(dy) == 1 for dx, dy in moves)
+
+    def h(x: int, y: int) -> float:
+        dx = abs(x - gx)
+        dy = abs(y - gy)
+        if allows_diagonal:
+            # Octile heuristic (8방향에서 직선=1, 대각=sqrt(2) 비용과 정합)
+            dmin = min(dx, dy)
+            dmax = max(dx, dy)
+            return (dmax - dmin) * _AXIS_MOVE_COST + dmin * _DIAGONAL_MOVE_COST
+        return float(dx + dy)  # 4방향 Manhattan
 
     # 힙: (f, g, x, y, t)
     open_heap: list = []
     heapq.heappush(open_heap, (h(sx, sy), 0, sx, sy, 0))
 
     came_from: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
-    g_score: Dict[Tuple[int, int, int], int] = {(sx, sy, 0): 0}
+    g_score: Dict[Tuple[int, int, int], float] = {(sx, sy, 0): 0.0}
 
     while open_heap:
+        if deadline is not None and time.perf_counter() >= deadline:
+            return None
         f, g, x, y, t = heapq.heappop(open_heap)
 
         cur_state = (x, y, t)
@@ -158,7 +219,7 @@ def astar_with_constraints(
                 continue
             if (x, y, nx, ny, t) in edge_constraints:
                 continue
-            new_g = g + 1
+            new_g = g + _move_cost(dx, dy)
             new_state = (nx, ny, nt)
             if new_g < g_score.get(new_state, float("inf")):
                 g_score[new_state] = new_g
@@ -270,8 +331,10 @@ def cbs_assign(
     assignment: np.ndarray,
     max_steps: int = MAX_STEPS,
     grid_margin: int = 5,
+    grid_scale: int = 1,
     strict_cbs: bool = True,
     max_iterations: Optional[int] = None,
+    timeout_sec: Optional[float] = None,
     move_model: str = "4n",
     blocked_cells: Optional[Set[Pos]] = None,
 ) -> Optional[PathsDict]:
@@ -304,36 +367,64 @@ def cbs_assign(
     ----
     - CBS 탐색 트리는 최악의 경우 지수적으로 성장한다.
       n이 클수록 (≥ 50) max_iterations 내에 해를 못 찾을 수 있음.
-    - 해를 못 찾으면 None 반환 → 호출부(timeline.py)에서 폴백 처리 권장.
+    - 해를 못 찾으면 None 반환. 호출부는 CBS 실패로 기록한다.
 
     Example
     -------
     # paths = cbs_assign(drones, targets, assignment, max_steps=100)
     # if paths is None:
-    #     print("CBS 탐색 실패 — 폴백 경로 사용")
+    #     print("CBS 탐색 실패")
     # else:
     #     assert detect_conflict(paths) is None
     """
     n = len(drones)
+    if grid_scale < 1:
+        raise ValueError("grid_scale must be >= 1")
+    deadline = (
+        time.perf_counter() + timeout_sec
+        if timeout_sec is not None and timeout_sec > 0
+        else None
+    )
 
-    # 실수 좌표 → 정수 격자 좌표 변환
+    scaled_margin = max(1, int(round(grid_margin * grid_scale)))
+
+    # 실수 좌표 → (고해상도) 정수 격자 좌표 변환
     starts: List[Pos] = [
-        (int(round(drones[i][0])), int(round(drones[i][1]))) for i in range(n)
-    ]
-    goals: List[Pos] = [
-        (int(round(targets[assignment[i]][0])), int(round(targets[assignment[i]][1])))
+        (
+            int(round(drones[i][0] * grid_scale)),
+            int(round(drones[i][1] * grid_scale)),
+        )
         for i in range(n)
     ]
+    goals: List[Pos] = [
+        (
+            int(round(targets[assignment[i]][0] * grid_scale)),
+            int(round(targets[assignment[i]][1] * grid_scale)),
+        )
+        for i in range(n)
+    ]
+    if len(set(starts)) < n or len(set(goals)) < n:
+        return None
 
     # ── 유한 격자 경계 구성 (논문형 G(V,E)에서 V를 bounded grid로 근사) ─────
     all_x = [p[0] for p in starts] + [p[0] for p in goals]
     all_y = [p[1] for p in starts] + [p[1] for p in goals]
-    min_x = min(all_x) - grid_margin
-    max_x = max(all_x) + grid_margin
-    min_y = min(all_y) - grid_margin
-    max_y = max(all_y) + grid_margin
+    min_x = min(all_x) - scaled_margin
+    max_x = max(all_x) + scaled_margin
+    min_y = min(all_y) - scaled_margin
+    max_y = max(all_y) + scaled_margin
     grid_bounds = (min_x, max_x, min_y, max_y)
-    blocked = blocked_cells or set()
+    blocked = (
+        {
+            (
+                int(round(pos[0] * grid_scale)),
+                int(round(pos[1] * grid_scale)),
+            )
+            for pos in blocked_cells
+        }
+        if blocked_cells
+        else set()
+    )
 
     if move_model == "4n":
         moves = _MOVES_4N_WAIT
@@ -360,26 +451,39 @@ def cbs_assign(
     slack_steps = 40
     effective_max_steps = max(max_steps, required_steps + slack_steps)
 
+    def _to_world(paths: PathsDict) -> PathsDict:
+        if grid_scale == 1:
+            return paths
+        inv = 1.0 / float(grid_scale)
+        return {
+            aid: [(x * inv, y * inv) for (x, y) in path]
+            for aid, path in paths.items()
+        }
+
     # ── 초기 경로 계획 (제약 없음) ────────────────────────────────────────
     init_paths: PathsDict = {}
     for i in range(n):
-        path = astar_with_constraints(
-            starts[i],
-            goals[i],
-            set(),
-            set(),
-            effective_max_steps,
-            grid_bounds,
-            blocked,
-            moves,
-        )
+        if blocked:
+            path = astar_with_constraints(
+                starts[i],
+                goals[i],
+                set(),
+                set(),
+                effective_max_steps,
+                grid_bounds,
+                blocked,
+                moves,
+                deadline,
+            )
+        else:
+            path = _direct_unconstrained_path(starts[i], goals[i], moves)
         if path is None:
             return None  # 기본 경로조차 없으면 즉시 실패
         init_paths[i] = path
 
-    def total_cost(paths: PathsDict) -> int:
-        """Sum-of-Costs : 모든 드론 경로 길이의 합."""
-        return sum(max(0, len(p) - 1) for p in paths.values())
+    def total_cost(paths: PathsDict) -> float:
+        """Sum-of-Costs : 모든 드론 연속거리 비용 합."""
+        return sum(_path_cost(p) for p in paths.values())
 
     # ── CBS 우선순위 큐 초기화 ────────────────────────────────────────────
     # 힙 원소: (cost, tiebreak_id, constraints_dict, paths_dict)
@@ -399,6 +503,8 @@ def cbs_assign(
 
     loops = 0
     while True:
+        if deadline is not None and time.perf_counter() >= deadline:
+            return None
         if max_loops is not None and loops >= max_loops:
             return None
         loops += 1
@@ -409,7 +515,7 @@ def cbs_assign(
 
         conflict = detect_conflict(paths)
         if conflict is None:
-            return paths  # ★ 충돌 없는 해 발견
+            return _to_world(paths)  # ★ 충돌 없는 해 발견
 
         ai, aj = conflict["agents"]
 
@@ -453,6 +559,7 @@ def cbs_assign(
                 grid_bounds,
                 blocked,
                 moves,
+                deadline,
             )
             if new_path is None:
                 continue  # 이 브랜치는 해 없음 → 스킵

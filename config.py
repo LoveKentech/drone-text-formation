@@ -4,10 +4,10 @@
 """
 
 # 데이터 좌표(픽셀) 기준 드론 중심–중심 최소 거리. morph 등에서 scatter 마커보다 크게 두면 겹쳐 보임이 줄어든다.
-MIN_SAFE_DIST = 6
+MIN_SAFE_DIST = 0.3
 # ``animate_morph`` 기본 마커 면적(s). 화면상 반경은 대략 √s pt 수준이라 MIN_SAFE_DIST와 함께 조절한다.
 MORPH_DRONE_SCATTER_S = 36.0
-MAX_STEPS = 200              # 최대 타임스텝
+MAX_STEPS = 500         # 최대 타임스텝
 # run_collision_resolution: 타임라인 0→T-1 스캔을 최대 몇 번 반복할지 (잔여 충돌 감소)
 COLLISION_RESOLUTION_MAX_PASSES = 25
 DRONE_COUNTS = [50, 100, 200]
@@ -17,8 +17,31 @@ SIZES = ["small", "medium", "large"]
 # main.py 배치 실험: 출발·도착 포메이션 (무작위 초기화 없음)
 EXPERIMENT_START_TEXT = "LOVE"
 EXPERIMENT_END_TEXT = "KENTECH"
+# 전체 비교 실험용 전환 목록. 순서쌍이므로 A→B와 B→A를 별도 조건으로 본다.
+EXPERIMENT_TRANSITIONS = [
+    ("AL", "LOVE"),
+    ("LOVE", "AL"),
+    ("LOVE", "KENTECH"),
+    ("KENTECH", "LOVE"),
+    ("AL", "KENTECH"),
+    ("KENTECH", "AL"),
+]
 # True면 hungarian + cbs trial, False면 hungarian 만 (CBS 탐색 생략)
-EXPERIMENT_INCLUDE_CBS = False
+EXPERIMENT_INCLUDE_CBS = True
+# True면 대표 케이스만 실행 (빠른 GIF 확인용), False면 EXPERIMENT_TRANSITIONS × DRONE_COUNTS × SIZES 전체 실행
+EXPERIMENT_REPRESENTATIVE_ONLY = False
+EXPERIMENT_REPRESENTATIVE_N = 200
+EXPERIMENT_REPRESENTATIVE_SIZE = "large"
+# 전체 실험 후 GIF로 저장할 대표 케이스. 모든 trial GIF 저장은 시간/용량이 커서 하지 않는다.
+EXPERIMENT_GIF_CASES = [
+    ("LOVE", "KENTECH", 200, "large"),
+]
+# CBS 내부 정수 격자 해상도 배율 (1=기존, 2 이상이면 더 촘촘한 격자)
+CBS_GRID_SCALE = 2
+# 200대 이상에서는 CBS 탐색 트리가 급격히 커질 수 있어 상한 내 실패로 기록한다.
+CBS_MAX_ITERATIONS = 100000
+# CBS가 이 시간 안에 해를 못 찾으면 실패로 기록한다. Hungarian 폴백은 사용하지 않는다.
+CBS_TIMEOUT_SEC = 60.0
 IMAGE_SIZE = (200, 100)      # 렌더링 이미지 크기
 
 CONTOUR_METHODS = ["contour", "poisson", "grid"]   # 좌표 샘플링 방식
