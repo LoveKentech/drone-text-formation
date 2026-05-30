@@ -10,7 +10,7 @@ MORPH_DRONE_SCATTER_S = 36.0
 MAX_STEPS = 500         # 최대 타임스텝
 # run_collision_resolution: 타임라인 0→T-1 스캔을 최대 몇 번 반복할지 (잔여 충돌 감소)
 COLLISION_RESOLUTION_MAX_PASSES = 25
-DRONE_COUNTS = [50, 100, 200]
+DRONE_COUNTS = [50, 100, 150, 200, 250, 300]
 STRINGS = ["AL", "LOVE", "KENTECH"]
 SIZES = ["small", "medium", "large"]
 

@@ -524,6 +524,7 @@ def run_experiment(
     extra_stats: Dict[str, object] = {**coordinate_stats, **cbs_grid_before_stats}
     cbs_fallback = False
     cbs_success: Optional[bool] = None
+    cbs_search_stats: Dict[str, object] = {}
 
     if algorithm == "hungarian":
         assign_time = hungarian_time
@@ -567,7 +568,7 @@ def run_experiment(
         extra_stats.update(precheck_stats)
         if precheck_ok:
             t0 = time.perf_counter()
-            paths = cbs_assign(
+            paths, cbs_search_stats = cbs_assign(
                 drones,
                 targets,
                 assignment,
@@ -577,11 +578,14 @@ def run_experiment(
                 max_iterations=CBS_MAX_ITERATIONS,
                 timeout_sec=CBS_TIMEOUT_SEC,
                 move_model="8n",
+                return_stats=True,
             )
             assign_time = time.perf_counter() - t0
+            extra_stats.update(cbs_search_stats)
         else:
             paths = None
             assign_time = 0.0
+            extra_stats["cbs_search_stop_reason"] = "precheck_failed"
             print(
                 f"  [WARN] CBS 입력 불가: {precheck_stats['cbs_skip_reason']}"
             )
@@ -605,10 +609,15 @@ def run_experiment(
             })
         else:
             if precheck_ok:
+                stop_reason = cbs_search_stats.get("cbs_search_stop_reason", "")
+                expanded_nodes = cbs_search_stats.get("cbs_search_expanded_nodes", "")
+                max_open = cbs_search_stats.get("cbs_search_max_open_size", "")
                 print(
                     f"  [WARN] CBS 탐색 실패 "
                     f"(n={n}, {formation_label}, size={size}, "
-                    f"max_iterations={CBS_MAX_ITERATIONS}, timeout={CBS_TIMEOUT_SEC}s)"
+                    f"stop={stop_reason}, expanded={expanded_nodes}, "
+                    f"max_open={max_open}, max_iterations={CBS_MAX_ITERATIONS}, "
+                    f"timeout={CBS_TIMEOUT_SEC}s)"
                 )
             cbs_success = False
             extra_stats.update({
@@ -620,8 +629,8 @@ def run_experiment(
             reason = (
                 f"precheck_failed: {precheck_stats['cbs_skip_reason']}"
                 if not precheck_ok
-                else f"planner_failed_or_iteration_limit:{CBS_MAX_ITERATIONS}"
-                f"_or_timeout:{CBS_TIMEOUT_SEC}s"
+                else f"planner_failed:{cbs_search_stats.get('cbs_search_stop_reason', 'unknown')}"
+                f":max_iterations:{CBS_MAX_ITERATIONS}:timeout:{CBS_TIMEOUT_SEC}s"
             )
             base = {
                 "experiment_run_id": experiment_run_id,

@@ -39,6 +39,12 @@ from config import (
 # 내부 헬퍼
 # ---------------------------------------------------------------------------
 
+def _step_toward(current: np.ndarray, goal: np.ndarray) -> np.ndarray:
+    """목표를 지나치지 않도록 축별 이동량을 최대 1로 제한한다."""
+    diff = goal - current
+    return np.where(np.abs(diff) <= 1.0, diff, np.sign(diff))
+
+
 def _recompute_from_goal(
     frames: np.ndarray,
     drone_idx: int,
@@ -58,7 +64,7 @@ def _recompute_from_goal(
     max_steps = frames.shape[0]
     for t in range(max(1, start_t), max_steps):
         prev = frames[t - 1, drone_idx]
-        frames[t, drone_idx] = prev + np.sign(goal - prev)
+        frames[t, drone_idx] = prev + _step_toward(prev, goal)
 
 
 # ---------------------------------------------------------------------------
@@ -73,15 +79,15 @@ def compute_timeline_greedy(
 ) -> np.ndarray:
     """
     주어진 배정 결과를 바탕으로, 매 스텝 각 드론이 목표를 향해
-    np.sign 으로 한 칸(대각선 포함) 이동하는 그리디 타임라인을 계산한다.
+    축별 최대 한 칸(대각선 포함) 이동하는 그리디 타임라인을 계산한다.
 
     이동 규칙
     ---------
     diff = goal - current_pos
-    step = np.sign(diff)          # 각 축 독립적으로 -1/0/+1
+    step = clip_to_goal(diff)     # 각 축 독립적으로 최대 -1/0/+1, 목표 지나침 방지
     next_pos = current_pos + step  # 1스텝 = Chebyshev 거리 1
 
-    목표에 도달한 드론은 np.sign((0,0)) = (0,0) 이므로 자동으로 정지한다.
+    목표에 도달한 드론은 step = (0,0) 이므로 자동으로 정지한다.
 
     Parameters
     ----------
@@ -107,8 +113,8 @@ def compute_timeline_greedy(
     for t in range(1, max_steps):
         for i in range(n):
             goal = targets[assignment[i]]
-            diff = goal - frames[t - 1, i]
-            frames[t, i] = frames[t - 1, i] + np.sign(diff)
+            prev = frames[t - 1, i]
+            frames[t, i] = prev + _step_toward(prev, goal)
 
     return frames
 
@@ -255,8 +261,8 @@ def resolve_collisions(
             if t + 1 < max_steps:
                 ga = targets[assignment[a]]
                 gb = targets[assignment[b]]
-                frames[t + 1, a] = pos_a + np.sign(ga - pos_a)
-                frames[t + 1, b] = pos_b + np.sign(gb - pos_b)
+                frames[t + 1, a] = pos_a + _step_toward(pos_a, ga)
+                frames[t + 1, b] = pos_b + _step_toward(pos_b, gb)
                 _recompute_from_goal(frames, a, ga, t + 2)
                 _recompute_from_goal(frames, b, gb, t + 2)
             continue

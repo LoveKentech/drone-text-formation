@@ -17,6 +17,7 @@ import math
 import os
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
@@ -337,7 +338,8 @@ def cbs_assign(
     timeout_sec: Optional[float] = None,
     move_model: str = "4n",
     blocked_cells: Optional[Set[Pos]] = None,
-) -> Optional[PathsDict]:
+    return_stats: bool = False,
+):
     """
     CBS(Conflict-Based Search)로 드론 전체의 충돌 없는 경로를 탐색한다.
 
@@ -361,7 +363,8 @@ def cbs_assign(
 
     Returns
     -------
-    {drone_id: [(x, y), ...]} — 드론별 충돌 없는 경로, 또는 None
+    {drone_id: [(x, y), ...]} — 드론별 충돌 없는 경로, 또는 None.
+    return_stats=True이면 (paths_or_none, stats) 튜플을 반환한다.
 
     주의
     ----
@@ -378,6 +381,88 @@ def cbs_assign(
     #     assert detect_conflict(paths) is None
     """
     n = len(drones)
+    started_at = time.perf_counter()
+    conflict_pair_counts: Counter[Tuple[int, int]] = Counter()
+    stats: Dict[str, object] = {
+        "cbs_search_stop_reason": "",
+        "cbs_search_expanded_nodes": 0,
+        "cbs_search_generated_nodes": 0,
+        "cbs_search_max_open_size": 0,
+        "cbs_search_conflicts_seen": 0,
+        "cbs_search_vertex_conflicts_seen": 0,
+        "cbs_search_edge_conflicts_seen": 0,
+        "cbs_search_first_conflict_type": "",
+        "cbs_search_first_conflict_t": "",
+        "cbs_search_first_conflict_agents": "",
+        "cbs_search_unique_conflict_pairs": 0,
+        "cbs_search_top_conflict_pair": "",
+        "cbs_search_top_conflict_pair_count": 0,
+        "cbs_search_low_level_astar_calls": 0,
+        "cbs_search_low_level_astar_failures": 0,
+        "cbs_search_low_level_astar_time_sec": 0.0,
+        "cbs_search_max_constraints": 0,
+        "cbs_search_initial_cost": "",
+        "cbs_search_solution_cost": "",
+        "cbs_search_required_steps": "",
+        "cbs_search_effective_max_steps": "",
+        "cbs_search_runtime_sec": "",
+    }
+
+    def _finish(paths: Optional[PathsDict], reason: str):
+        stats["cbs_search_stop_reason"] = reason
+        stats["cbs_search_runtime_sec"] = round(
+            time.perf_counter() - started_at, 6
+        )
+        if conflict_pair_counts:
+            pair, count = conflict_pair_counts.most_common(1)[0]
+            stats["cbs_search_unique_conflict_pairs"] = len(conflict_pair_counts)
+            stats["cbs_search_top_conflict_pair"] = f"{pair[0]}-{pair[1]}"
+            stats["cbs_search_top_conflict_pair_count"] = count
+        stats["cbs_search_low_level_astar_time_sec"] = round(
+            float(stats["cbs_search_low_level_astar_time_sec"]), 6
+        )
+        if return_stats:
+            return paths, stats
+        return paths
+
+    def _constraint_count(constraints: Dict[int, AgentConstraints]) -> int:
+        return sum(len(c.vertex) + len(c.edge) for c in constraints.values())
+
+    def _run_low_level_astar(
+        start: Pos,
+        goal: Pos,
+        vertex_constraints: Set[Constraint],
+        edge_constraints: Set[EdgeConstraint],
+        max_steps_for_agent: int,
+        bounds: Tuple[int, int, int, int],
+        blocked_for_agent: Set[Pos],
+        moves_for_agent: List[Tuple[int, int]],
+    ) -> Optional[Path]:
+        stats["cbs_search_low_level_astar_calls"] = (
+            int(stats["cbs_search_low_level_astar_calls"]) + 1
+        )
+        t_astar = time.perf_counter()
+        path = astar_with_constraints(
+            start,
+            goal,
+            vertex_constraints,
+            edge_constraints,
+            max_steps_for_agent,
+            bounds,
+            blocked_for_agent,
+            moves_for_agent,
+            deadline,
+        )
+        stats["cbs_search_low_level_astar_time_sec"] = (
+            float(stats["cbs_search_low_level_astar_time_sec"])
+            + time.perf_counter() - t_astar
+        )
+        if path is None:
+            stats["cbs_search_low_level_astar_failures"] = (
+                int(stats["cbs_search_low_level_astar_failures"]) + 1
+            )
+        return path
+
     if grid_scale < 1:
         raise ValueError("grid_scale must be >= 1")
     deadline = (
@@ -404,7 +489,7 @@ def cbs_assign(
         for i in range(n)
     ]
     if len(set(starts)) < n or len(set(goals)) < n:
-        return None
+        return _finish(None, "duplicate_start_or_goal")
 
     # ── 유한 격자 경계 구성 (논문형 G(V,E)에서 V를 bounded grid로 근사) ─────
     all_x = [p[0] for p in starts] + [p[0] for p in goals]
@@ -450,6 +535,8 @@ def cbs_assign(
     required_steps = max(lb_per_agent) if lb_per_agent else 0
     slack_steps = 40
     effective_max_steps = max(max_steps, required_steps + slack_steps)
+    stats["cbs_search_required_steps"] = required_steps
+    stats["cbs_search_effective_max_steps"] = effective_max_steps
 
     def _to_world(paths: PathsDict) -> PathsDict:
         if grid_scale == 1:
@@ -464,7 +551,7 @@ def cbs_assign(
     init_paths: PathsDict = {}
     for i in range(n):
         if blocked:
-            path = astar_with_constraints(
+            path = _run_low_level_astar(
                 starts[i],
                 goals[i],
                 set(),
@@ -473,12 +560,13 @@ def cbs_assign(
                 grid_bounds,
                 blocked,
                 moves,
-                deadline,
             )
         else:
             path = _direct_unconstrained_path(starts[i], goals[i], moves)
         if path is None:
-            return None  # 기본 경로조차 없으면 즉시 실패
+            if deadline is not None and time.perf_counter() >= deadline:
+                return _finish(None, "timeout")
+            return _finish(None, "initial_path_failed")
         init_paths[i] = path
 
     def total_cost(paths: PathsDict) -> float:
@@ -495,6 +583,9 @@ def cbs_assign(
     open_list: list = [
         (total_cost(init_paths), next(counter), init_constraints, init_paths)
     ]
+    stats["cbs_search_generated_nodes"] = 1
+    stats["cbs_search_max_open_size"] = 1
+    stats["cbs_search_initial_cost"] = round(total_cost(init_paths), 6)
 
     if strict_cbs:
         max_loops = None
@@ -504,20 +595,45 @@ def cbs_assign(
     loops = 0
     while True:
         if deadline is not None and time.perf_counter() >= deadline:
-            return None
+            return _finish(None, "timeout")
         if max_loops is not None and loops >= max_loops:
-            return None
-        loops += 1
+            return _finish(None, "iteration_limit")
         if not open_list:
-            return None
+            return _finish(None, "open_empty")
+        loops += 1
 
         cost, _, constraints, paths = heapq.heappop(open_list)
+        stats["cbs_search_expanded_nodes"] = int(
+            stats["cbs_search_expanded_nodes"]
+        ) + 1
+        stats["cbs_search_max_constraints"] = max(
+            int(stats["cbs_search_max_constraints"]),
+            _constraint_count(constraints),
+        )
 
         conflict = detect_conflict(paths)
         if conflict is None:
-            return _to_world(paths)  # ★ 충돌 없는 해 발견
+            stats["cbs_search_solution_cost"] = round(cost, 6)
+            return _finish(_to_world(paths), "success")  # ★ 충돌 없는 해 발견
 
         ai, aj = conflict["agents"]
+        pair = tuple(sorted((ai, aj)))
+        conflict_pair_counts[pair] += 1
+        stats["cbs_search_conflicts_seen"] = int(
+            stats["cbs_search_conflicts_seen"]
+        ) + 1
+        if conflict["type"] == "vertex":
+            stats["cbs_search_vertex_conflicts_seen"] = int(
+                stats["cbs_search_vertex_conflicts_seen"]
+            ) + 1
+        else:
+            stats["cbs_search_edge_conflicts_seen"] = int(
+                stats["cbs_search_edge_conflicts_seen"]
+            ) + 1
+        if not stats["cbs_search_first_conflict_type"]:
+            stats["cbs_search_first_conflict_type"] = conflict["type"]
+            stats["cbs_search_first_conflict_t"] = conflict["t"]
+            stats["cbs_search_first_conflict_agents"] = f"{ai}-{aj}"
 
         # ── 두 자식 노드 생성 ─────────────────────────────────────────────
         for agent in (ai, aj):
@@ -550,7 +666,7 @@ def cbs_assign(
                 )
 
             # 해당 드론만 재계획
-            new_path = astar_with_constraints(
+            new_path = _run_low_level_astar(
                 starts[agent],
                 goals[agent],
                 set(new_constraints[agent].vertex),
@@ -559,20 +675,33 @@ def cbs_assign(
                 grid_bounds,
                 blocked,
                 moves,
-                deadline,
             )
+            if deadline is not None and time.perf_counter() >= deadline:
+                return _finish(None, "timeout")
             if new_path is None:
                 continue  # 이 브랜치는 해 없음 → 스킵
 
             new_paths = dict(paths)
             new_paths[agent] = new_path
+            new_cost = total_cost(new_paths)
 
             heapq.heappush(
                 open_list,
-                (total_cost(new_paths), next(counter), new_constraints, new_paths),
+                (new_cost, next(counter), new_constraints, new_paths),
+            )
+            stats["cbs_search_generated_nodes"] = int(
+                stats["cbs_search_generated_nodes"]
+            ) + 1
+            stats["cbs_search_max_open_size"] = max(
+                int(stats["cbs_search_max_open_size"]),
+                len(open_list),
+            )
+            stats["cbs_search_max_constraints"] = max(
+                int(stats["cbs_search_max_constraints"]),
+                _constraint_count(new_constraints),
             )
 
-    return None  # strict=False에서 반복 상한 초과 시 도달
+    return _finish(None, "unknown")  # strict=False에서 보통 도달하지 않음
 
 
 # ---------------------------------------------------------------------------
