@@ -466,6 +466,10 @@ def _cbs_failed_metrics(
         "resolve_total_detected": "",
         "resolve_steps_with_collision_first_pass": "",
         "resolve_remaining_reported": "",
+        "resolve_stop_reason": "",
+        "resolve_runtime_sec": "",
+        "resolve_best_remaining": "",
+        "resolve_stagnant_passes": "",
     }
     row.update(extra_stats)
     return row
@@ -505,13 +509,18 @@ def run_experiment(
         grid_scale=CBS_GRID_SCALE,
         min_safe_dist=min_safe_dist,
     )
+    heuristic_step_size = 1.0 / float(CBS_GRID_SCALE)
 
     t0 = time.perf_counter()
     _, assignment = compute_assignment(drones, targets)
     hungarian_time = time.perf_counter() - t0
 
     frames_raw = compute_timeline_greedy(
-        drones, targets, assignment, max_steps=max_steps
+        drones,
+        targets,
+        assignment,
+        max_steps=max_steps,
+        step_size=heuristic_step_size,
     )
     collision_before_raw = _count_all_collisions(frames_raw, min_dist=min_safe_dist)
     cbs_grid_before_stats = _cbs_grid_stats_for_frames(
@@ -535,7 +544,9 @@ def run_experiment(
             max_steps=max_steps,
             min_dist=min_safe_dist,
             frames_raw=frames_raw,
-            smooth_visual=True,
+            smooth_visual=False,
+            step_size=heuristic_step_size,
+            grid_scale=CBS_GRID_SCALE,
         )
         collision_before = collision_before_raw
         collision_after = stats["remaining"]
@@ -544,6 +555,10 @@ def run_experiment(
             "total_detected": stats.get("total_detected"),
             "steps_with_collision": stats.get("steps_with_collision"),
             "remaining": stats.get("remaining"),
+            "stop_reason": stats.get("stop_reason"),
+            "runtime_sec": stats.get("runtime_sec"),
+            "best_remaining": stats.get("best_remaining"),
+            "stagnant_passes": stats.get("stagnant_passes"),
         }
         grid_after_stats = _cbs_grid_stats_for_frames(
             frames,
@@ -556,6 +571,25 @@ def run_experiment(
             "cbs_grid_first_conflict_t": grid_after_stats[
                 "cbs_grid_first_conflict_t_after"
             ],
+            "heuristic_step_size": heuristic_step_size,
+            "soc_cost": round(float(stats["soc_cost"]), 6),
+            "soc_max_agent_cost": round(float(stats["soc_max_agent_cost"]), 6),
+        })
+        heuristic_success = grid_after_stats["cbs_grid_conflicts_after"] == 0
+        extra_stats.update({
+            "heuristic_planner_success": 1 if heuristic_success else 0,
+            "heuristic_solution_status": (
+                "SUCCESS" if heuristic_success else "UNSAFE_RESIDUAL_CONFLICTS"
+            ),
+            "heuristic_stop_reason": (
+                "grid_conflict_free"
+                if heuristic_success
+                else (
+                    "distance_conflict_free_but_grid_conflicts_remain"
+                    if stats.get("stop_reason") == "distance_conflict_free"
+                    else stats.get("stop_reason", "unknown")
+                )
+            ),
         })
     else:
         precheck_ok, precheck_stats = _cbs_precheck(
@@ -593,6 +627,13 @@ def run_experiment(
         if paths is not None:
             cbs_success = True
             frames = _paths_to_frames(paths, n, max_steps)
+            extra_stats.update({
+                "soc_cost": cbs_search_stats.get("cbs_search_solution_cost", ""),
+                "soc_max_agent_cost": max(
+                    (len(path) - 1 for path in paths.values()),
+                    default=0,
+                ),
+            })
             collision_before = collision_before_raw
             collision_after = _count_all_collisions(frames, min_dist=min_safe_dist)
             grid_after_stats = _cbs_grid_stats_for_frames(
@@ -658,7 +699,23 @@ def run_experiment(
             )
             return base
 
-    total_dist, max_dist = _compute_dist_metrics(frames)
+    visual_total_dist, visual_max_dist = _compute_dist_metrics(frames)
+    total_dist = float(
+        stats.get("total_dist_before_smoothing", visual_total_dist)
+        if algorithm == "hungarian"
+        else visual_total_dist
+    )
+    max_dist = float(
+        stats.get("max_dist_before_smoothing", visual_max_dist)
+        if algorithm == "hungarian"
+        else visual_max_dist
+    )
+    extra_stats.update({
+        "distance_metric": "pre_smoothing_grid_path_world_units",
+        "visual_total_dist": round(visual_total_dist, 6),
+        "visual_max_dist": round(visual_max_dist, 6),
+        "soc_cost_metric": "paper_sum_of_costs_each_action_before_final_arrival_cost1",
+    })
     pipeline_time = time.perf_counter() - total_start
 
     base = {
@@ -719,10 +776,15 @@ def _save_animations(
         grid_scale=CBS_GRID_SCALE,
         min_safe_dist=MIN_SAFE_DIST,
     )
+    heuristic_step_size = 1.0 / float(CBS_GRID_SCALE)
     _, assignment = compute_assignment(drones, targets)
 
     frames_raw = compute_timeline_greedy(
-        drones, targets, assignment, max_steps=MAX_STEPS
+        drones,
+        targets,
+        assignment,
+        max_steps=MAX_STEPS,
+        step_size=heuristic_step_size,
     )
     frames_resolved, assignment, stats, _ = greedy_timeline_then_resolve(
         drones,
@@ -731,12 +793,26 @@ def _save_animations(
         max_steps=MAX_STEPS,
         min_dist=MIN_SAFE_DIST,
         frames_raw=frames_raw,
-        smooth_visual=True,
+        smooth_visual=False,
+        step_size=heuristic_step_size,
+        grid_scale=CBS_GRID_SCALE,
     )
     frames_resolved = _trim_frames(frames_resolved)
+    grid_after_stats = _count_cbs_grid_conflicts(
+        frames_resolved,
+        grid_scale=CBS_GRID_SCALE,
+    )
+    heuristic_status = (
+        "SUCCESS"
+        if grid_after_stats["total_conflicts"] == 0
+        else "UNSAFE"
+    )
     print(
-        f"[충돌회피] 대표 GIF 잔여={stats['remaining']}  "
-        f"패스={stats['passes_used']}  감지누적={stats['total_detected']}"
+        f"[충돌회피] 대표 GIF HEURISTIC={heuristic_status}  "
+        f"거리잔여={stats['remaining']}  "
+        f"격자잔여={grid_after_stats['total_conflicts']}  "
+        f"패스={stats['passes_used']}  stop={stats['stop_reason']}  "
+        f"감지누적={stats['total_detected']}"
     )
 
     base = f"{formation_label}_{n}_{size}"
@@ -883,9 +959,18 @@ if __name__ == "__main__":
                     cbs_status = "  CBS=SUCCESS"
                 elif result.get("cbs_planner_success") == 0:
                     cbs_status = "  CBS=FAILED"
+            elif result["algorithm"] == "hungarian":
+                if result.get("heuristic_planner_success") == 1:
+                    cbs_status = "  HEURISTIC=SUCCESS"
+                elif result.get("heuristic_planner_success") == 0:
+                    cbs_status = (
+                        "  HEURISTIC=UNSAFE"
+                        f"({result.get('heuristic_stop_reason', 'unknown')})"
+                    )
             print(
                 f"         trial_id={result['trial_id']}  "
                 f"총거리={_fmt_num(result['total_dist'], 1)}  "
+                f"SoC={_fmt_num(result.get('soc_cost'), 1)}  "
                 f"거리충돌={_fmt_num(result.get('collision_pair_events_before'), 0)}→"
                 f"{_fmt_num(result.get('collision_pair_events_after'), 0)}  "
                 f"격자충돌={_fmt_num(result.get('cbs_grid_conflicts_before'), 0)}→"

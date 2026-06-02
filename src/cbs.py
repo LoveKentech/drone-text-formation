@@ -48,20 +48,15 @@ Path       = List[Pos]
 PathsDict  = Dict[int, Path]
 
 _AXIS_MOVE_COST = 1.0
-_DIAGONAL_MOVE_COST = math.sqrt(2.0)
 
 
 def _move_cost(dx: int, dy: int) -> float:
-    """격자 한 스텝의 연속거리 기반 비용."""
-    if dx == 0 and dy == 0:
-        return _AXIS_MOVE_COST
-    if dx != 0 and dy != 0:
-        return _DIAGONAL_MOVE_COST
+    """논문 기본 SoC: 목표 도착 전 move/wait action은 모두 비용 1."""
     return _AXIS_MOVE_COST
 
 
 def _path_cost(path: Path) -> float:
-    """경로의 연속거리 기반 누적 비용."""
+    """논문 기본 SoC 기준 단일 agent의 도착 전 action 수."""
     if len(path) < 2:
         return 0.0
     return sum(
@@ -171,10 +166,7 @@ def astar_with_constraints(
         dx = abs(x - gx)
         dy = abs(y - gy)
         if allows_diagonal:
-            # Octile heuristic (8방향에서 직선=1, 대각=sqrt(2) 비용과 정합)
-            dmin = min(dx, dy)
-            dmax = max(dx, dy)
-            return (dmax - dmin) * _AXIS_MOVE_COST + dmin * _DIAGONAL_MOVE_COST
+            return float(max(dx, dy))  # 8방향 unit-cost Chebyshev
         return float(dx + dy)  # 4방향 Manhattan
 
     # 힙: (f, g, x, y, t)
@@ -570,7 +562,7 @@ def cbs_assign(
         init_paths[i] = path
 
     def total_cost(paths: PathsDict) -> float:
-        """Sum-of-Costs : 모든 드론 연속거리 비용 합."""
+        """논문 기본 Sum-of-Costs: 모든 드론의 최종 도착 전 action 수 합."""
         return sum(_path_cost(p) for p in paths.values())
 
     # ── CBS 우선순위 큐 초기화 ────────────────────────────────────────────

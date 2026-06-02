@@ -16,9 +16,11 @@ frames : ndarray (max_steps, n, 2)
 3. Wait     : 대안 칸 없음 → 현재 위치 유지 + 이후 경로 재계산.
 """
 
+import hashlib
 import os
 import sys
-from typing import Dict, List, Tuple
+import time
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -26,6 +28,8 @@ from scipy.spatial import cKDTree
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import (
     COLLISION_RESOLUTION_MAX_PASSES,
+    COLLISION_RESOLUTION_STAGNATION_PASSES,
+    COLLISION_RESOLUTION_TIMEOUT_SEC,
     DETOUR_TIE_EPS,
     MIN_SAFE_DIST,
     MAX_STEPS,
@@ -39,10 +43,16 @@ from config import (
 # 내부 헬퍼
 # ---------------------------------------------------------------------------
 
-def _step_toward(current: np.ndarray, goal: np.ndarray) -> np.ndarray:
-    """목표를 지나치지 않도록 축별 이동량을 최대 1로 제한한다."""
+def _step_toward(
+    current: np.ndarray,
+    goal: np.ndarray,
+    step_size: float = 1.0,
+) -> np.ndarray:
+    """목표를 지나치지 않도록 축별 이동량을 최대 step_size로 제한한다."""
+    if step_size <= 0:
+        raise ValueError("step_size must be > 0")
     diff = goal - current
-    return np.where(np.abs(diff) <= 1.0, diff, np.sign(diff))
+    return np.where(np.abs(diff) <= step_size, diff, np.sign(diff) * step_size)
 
 
 def _recompute_from_goal(
@@ -50,6 +60,7 @@ def _recompute_from_goal(
     drone_idx: int,
     goal: np.ndarray,
     start_t: int,
+    step_size: float = 1.0,
 ) -> None:
     """
     start_t부터 끝까지 드론의 경로를 np.sign 이동으로 재계산 (in-place).
@@ -64,7 +75,7 @@ def _recompute_from_goal(
     max_steps = frames.shape[0]
     for t in range(max(1, start_t), max_steps):
         prev = frames[t - 1, drone_idx]
-        frames[t, drone_idx] = prev + _step_toward(prev, goal)
+        frames[t, drone_idx] = prev + _step_toward(prev, goal, step_size)
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +87,7 @@ def compute_timeline_greedy(
     targets: np.ndarray,
     assignment: np.ndarray,
     max_steps: int = MAX_STEPS,
+    step_size: float = 1.0,
 ) -> np.ndarray:
     """
     주어진 배정 결과를 바탕으로, 매 스텝 각 드론이 목표를 향해
@@ -114,7 +126,7 @@ def compute_timeline_greedy(
         for i in range(n):
             goal = targets[assignment[i]]
             prev = frames[t - 1, i]
-            frames[t, i] = prev + _step_toward(prev, goal)
+            frames[t, i] = prev + _step_toward(prev, goal, step_size)
 
     return frames
 
@@ -207,6 +219,7 @@ def resolve_collisions(
     targets: np.ndarray,
     collisions: List[Tuple[int, int]],
     t: int,
+    step_size: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     detect_collisions 결과를 받아 3단계 우선순위로 충돌을 해결한다.
@@ -261,10 +274,10 @@ def resolve_collisions(
             if t + 1 < max_steps:
                 ga = targets[assignment[a]]
                 gb = targets[assignment[b]]
-                frames[t + 1, a] = pos_a + _step_toward(pos_a, ga)
-                frames[t + 1, b] = pos_b + _step_toward(pos_b, gb)
-                _recompute_from_goal(frames, a, ga, t + 2)
-                _recompute_from_goal(frames, b, gb, t + 2)
+                frames[t + 1, a] = pos_a + _step_toward(pos_a, ga, step_size)
+                frames[t + 1, b] = pos_b + _step_toward(pos_b, gb, step_size)
+                _recompute_from_goal(frames, a, ga, t + 2, step_size)
+                _recompute_from_goal(frames, b, gb, t + 2, step_size)
             continue
 
         if t + 1 >= max_steps:
@@ -277,7 +290,7 @@ def resolve_collisions(
         candidates: List[Tuple[np.ndarray, float]] = []
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
-                cand = pos_b + np.array([dx, dy], dtype=float)
+                cand = pos_b + step_size * np.array([dx, dy], dtype=float)
                 if np.linalg.norm(cand - next_pos_a) >= MIN_SAFE_DIST:
                     d_goal = np.linalg.norm(cand - goal_b)
                     candidates.append((cand, d_goal))
@@ -304,12 +317,12 @@ def resolve_collisions(
         # 현재 위치와 같으면(wait와 동일) strategy 3으로 넘김
         if best_pos is not None and not np.allclose(best_pos, pos_b):
             frames[t + 1, b] = best_pos
-            _recompute_from_goal(frames, b, goal_b, t + 2)
+            _recompute_from_goal(frames, b, goal_b, t + 2, step_size)
             continue
 
         # ── Strategy 3 : Wait ────────────────────────────────────────────
         frames[t + 1, b] = pos_b.copy()
-        _recompute_from_goal(frames, b, goal_b, t + 2)
+        _recompute_from_goal(frames, b, goal_b, t + 2, step_size)
 
     return frames, assignment
 
@@ -320,6 +333,9 @@ def run_collision_resolution(
     targets: np.ndarray,
     min_dist: float = MIN_SAFE_DIST,
     max_passes: int = COLLISION_RESOLUTION_MAX_PASSES,
+    timeout_sec: Optional[float] = COLLISION_RESOLUTION_TIMEOUT_SEC,
+    stagnation_passes: int = COLLISION_RESOLUTION_STAGNATION_PASSES,
+    step_size: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, Dict]:
     """
     전체 타임라인에 대해 detect_collisions → resolve_collisions 를 순차적으로 실행한다.
@@ -334,6 +350,8 @@ def run_collision_resolution(
     targets    : ndarray (n, 2)            — 목표 좌표 (충돌 해결 시 재경로화에 사용)
     min_dist   : 충돌 판정 거리 기준 (기본값 MIN_SAFE_DIST)
     max_passes : 타임라인 전체 스캔 반복 상한 (기본 `config.COLLISION_RESOLUTION_MAX_PASSES`)
+    timeout_sec: 충돌 복구 시간 상한. None이면 시간 제한 없음.
+    stagnation_passes: 잔여 충돌 최솟값이 개선되지 않아도 허용할 연속 패스 수.
 
     Returns
     -------
@@ -347,6 +365,7 @@ def run_collision_resolution(
         'steps_with_collision': int,   # 첫 패스에서 충돌이 있었던 서로 다른 t 수
         'remaining'           : int,   # 최종 잔여 충돌 쌍 수 (전체 스캔)
         'passes_used'         : int,   # 실제 반복한 스캔 횟수
+        'stop_reason'         : str,   # distance_conflict_free/timeout/cycle_detected/...
     }
 
     Note
@@ -356,17 +375,44 @@ def run_collision_resolution(
     max_steps = frames.shape[0]
     frames = frames.copy()
     assignment = assignment.copy()
+    if max_passes < 1:
+        raise ValueError("max_passes must be >= 1")
+    if timeout_sec is not None and timeout_sec <= 0:
+        raise ValueError("timeout_sec must be > 0 or None")
+    if stagnation_passes < 1:
+        raise ValueError("stagnation_passes must be >= 1")
 
     per_step: Dict[int, int] = {}
     steps_with_collision = 0
     total_detected = 0
     passes_used = 0
     first_pass_collision_ts: set[int] = set()
+    started_at = time.perf_counter()
+    deadline = started_at + timeout_sec if timeout_sec is not None else None
 
+    def _remaining_collisions() -> int:
+        return sum(
+            len(detect_collisions(frames, t, min_dist)) for t in range(max_steps)
+        )
+
+    def _state_fingerprint() -> bytes:
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(np.ascontiguousarray(frames).tobytes())
+        digest.update(np.ascontiguousarray(assignment).tobytes())
+        return digest.digest()
+
+    best_remaining = _remaining_collisions()
+    stagnant_passes = 0
+    stop_reason = "max_passes"
+    seen_states = {_state_fingerprint()}
     for _ in range(max_passes):
         passes_used += 1
         any_this_pass = False
+        timed_out = False
         for t in range(max_steps):
+            if deadline is not None and time.perf_counter() >= deadline:
+                timed_out = True
+                break
             collisions = detect_collisions(frames, t, min_dist)
             if not collisions:
                 continue
@@ -377,14 +423,37 @@ def run_collision_resolution(
                 first_pass_collision_ts.add(t)
                 steps_with_collision += 1
 
-            frames, assignment = resolve_collisions(frames, assignment, targets, collisions, t)
+            frames, assignment = resolve_collisions(
+                frames,
+                assignment,
+                targets,
+                collisions,
+                t,
+                step_size=step_size,
+            )
 
-        if not any_this_pass:
+        remaining = _remaining_collisions()
+        if timed_out:
+            stop_reason = "timeout"
             break
+        if remaining == 0 or not any_this_pass:
+            stop_reason = "distance_conflict_free"
+            break
+        state = _state_fingerprint()
+        if state in seen_states:
+            stop_reason = "cycle_detected"
+            break
+        seen_states.add(state)
+        if remaining < best_remaining:
+            best_remaining = remaining
+            stagnant_passes = 0
+        else:
+            stagnant_passes += 1
+            if stagnant_passes >= stagnation_passes:
+                stop_reason = "stagnation"
+                break
 
-    remaining = sum(
-        len(detect_collisions(frames, t, min_dist)) for t in range(max_steps)
-    )
+    remaining = _remaining_collisions()
 
     for t in range(max_steps):
         c = detect_collisions(frames, t, min_dist)
@@ -397,6 +466,10 @@ def run_collision_resolution(
         "steps_with_collision": steps_with_collision,
         "remaining": remaining,
         "passes_used": passes_used,
+        "stop_reason": stop_reason,
+        "runtime_sec": round(time.perf_counter() - started_at, 6),
+        "best_remaining": best_remaining,
+        "stagnant_passes": stagnant_passes,
     }
 
     return frames, assignment, stats
@@ -566,6 +639,10 @@ if __name__ == "__main__":
         "steps_with_collision",
         "remaining",
         "passes_used",
+        "stop_reason",
+        "runtime_sec",
+        "best_remaining",
+        "stagnant_passes",
     }
     # remaining 은 최종 frames 전체 재스캔 결과이므로 total_detected 와 단순 대소 비교 불가
 

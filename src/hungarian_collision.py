@@ -26,6 +26,21 @@ from .timeline import (
 )
 
 
+def _paper_sum_of_costs(frames: np.ndarray, grid_scale: int) -> Tuple[float, float]:
+    """논문 기본 SoC로 드론별 최종 도착 전 action 수를 계산한다."""
+    cells = np.rint(np.asarray(frames, dtype=float) * grid_scale).astype(int)
+    deltas = np.diff(cells, axis=0)
+    costs = []
+    for drone_deltas in np.swapaxes(deltas, 0, 1):
+        moving = np.flatnonzero(np.any(drone_deltas != 0, axis=1))
+        if not len(moving):
+            costs.append(0.0)
+            continue
+        active = drone_deltas[: moving[-1] + 1]
+        costs.append(float(len(active)))
+    return float(sum(costs)), float(max(costs, default=0.0))
+
+
 def compute_assignment(
     drones: np.ndarray,
     targets: np.ndarray,
@@ -52,6 +67,8 @@ def greedy_timeline_then_resolve(
     frames_raw: Optional[np.ndarray] = None,
     max_passes: int = COLLISION_RESOLUTION_MAX_PASSES,
     smooth_visual: bool = True,
+    step_size: float = 1.0,
+    grid_scale: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray, Dict, np.ndarray]:
     """
     그리디(sign) 타임라인 생성 후 충돌 회피를 적용한다.
@@ -66,7 +83,11 @@ def greedy_timeline_then_resolve(
     """
     if frames_raw is None:
         frames_raw = compute_timeline_greedy(
-            drones, targets, assignment, max_steps=max_steps
+            drones,
+            targets,
+            assignment,
+            max_steps=max_steps,
+            step_size=step_size,
         )
     frames, assignment, stats = run_collision_resolution(
         frames_raw,
@@ -74,7 +95,24 @@ def greedy_timeline_then_resolve(
         targets,
         min_dist=min_dist,
         max_passes=max_passes,
+        step_size=step_size,
     )
+    diffs = np.diff(frames, axis=0)
+    step_dists = np.linalg.norm(diffs, axis=2)
+    drone_dists = step_dists.sum(axis=0)
+    stats = {
+        **stats,
+        "total_dist_before_smoothing": float(drone_dists.sum()),
+        "max_dist_before_smoothing": float(drone_dists.max())
+        if len(drone_dists)
+        else 0.0,
+    }
+    soc_cost, soc_max_agent_cost = _paper_sum_of_costs(frames, grid_scale)
+    stats = {
+        **stats,
+        "soc_cost": soc_cost,
+        "soc_max_agent_cost": soc_max_agent_cost,
+    }
     if smooth_visual:
         frames = smooth_timeline_separation(frames, min_dist=min_dist)
         remaining = sum(

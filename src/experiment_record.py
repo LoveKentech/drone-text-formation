@@ -63,6 +63,8 @@ def config_snapshot() -> Dict[str, Any]:
         "MIN_SAFE_DIST",
         "MAX_STEPS",
         "COLLISION_RESOLUTION_MAX_PASSES",
+        "COLLISION_RESOLUTION_TIMEOUT_SEC",
+        "COLLISION_RESOLUTION_STAGNATION_PASSES",
         "DRONE_COUNTS",
         "STRINGS",
         "SIZES",
@@ -196,11 +198,19 @@ def compute_evaluation_metrics(
             "steps_with_collision", ""
         )
         row["resolve_remaining_reported"] = stats_resolve.get("remaining", "")
+        row["resolve_stop_reason"] = stats_resolve.get("stop_reason", "")
+        row["resolve_runtime_sec"] = stats_resolve.get("runtime_sec", "")
+        row["resolve_best_remaining"] = stats_resolve.get("best_remaining", "")
+        row["resolve_stagnant_passes"] = stats_resolve.get("stagnant_passes", "")
     else:
         row["resolve_passes_used"] = ""
         row["resolve_total_detected"] = ""
         row["resolve_steps_with_collision_first_pass"] = ""
         row["resolve_remaining_reported"] = ""
+        row["resolve_stop_reason"] = ""
+        row["resolve_runtime_sec"] = ""
+        row["resolve_best_remaining"] = ""
+        row["resolve_stagnant_passes"] = ""
 
     if extra_stats is not None:
         row.update(extra_stats)
@@ -222,6 +232,12 @@ _TRIAL_COLUMN_ORDER = [
     "max_steps",
     "total_dist",
     "max_dist",
+    "distance_metric",
+    "visual_total_dist",
+    "visual_max_dist",
+    "soc_cost",
+    "soc_max_agent_cost",
+    "soc_cost_metric",
     "mean_dist_per_drone",
     "assign_time_sec",
     "pipeline_time_sec",
@@ -234,6 +250,9 @@ _TRIAL_COLUMN_ORDER = [
     "collision_pair_events_reduced",
     "collision_residual_ratio_vs_before",
     "is_collision_free",
+    "heuristic_planner_success",
+    "heuristic_solution_status",
+    "heuristic_stop_reason",
     "cbs_planner_success",
     "cbs_used_hungarian_fallback",
     "cbs_failure_reason",
@@ -291,6 +310,7 @@ _TRIAL_COLUMN_ORDER = [
     "cbs_precheck_final_close_dist",
     "cbs_ready_grid_scale",
     "cbs_ready_coordinate_adjustment",
+    "heuristic_step_size",
     "start_cbs_ready_reassigned_cells",
     "start_cbs_ready_duplicate_cells_before",
     "start_cbs_ready_duplicate_cells_after",
@@ -313,6 +333,10 @@ _TRIAL_COLUMN_ORDER = [
     "resolve_total_detected",
     "resolve_steps_with_collision_first_pass",
     "resolve_remaining_reported",
+    "resolve_stop_reason",
+    "resolve_runtime_sec",
+    "resolve_best_remaining",
+    "resolve_stagnant_passes",
     "trajectory_type",
     "collision_avoidance_type",
     "collision_reduction_ratio",

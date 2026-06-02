@@ -8,8 +8,10 @@ MIN_SAFE_DIST = 0.3
 # ``animate_morph`` 기본 마커 면적(s). 화면상 반경은 대략 √s pt 수준이라 MIN_SAFE_DIST와 함께 조절한다.
 MORPH_DRONE_SCATTER_S = 36.0
 MAX_STEPS = 500         # 최대 타임스텝
-# run_collision_resolution: 타임라인 0→T-1 스캔을 최대 몇 번 반복할지 (잔여 충돌 감소)
-COLLISION_RESOLUTION_MAX_PASSES = 25
+# heuristic 충돌 복구: 무제한 루프 대신 충분히 큰 상한과 종료 조건을 함께 둔다.
+COLLISION_RESOLUTION_MAX_PASSES = 100000
+COLLISION_RESOLUTION_TIMEOUT_SEC = 200.0
+COLLISION_RESOLUTION_STAGNATION_PASSES = 20
 DRONE_COUNTS = [50, 100, 150, 200, 250, 300]
 STRINGS = ["AL", "LOVE", "KENTECH"]
 SIZES = ["small", "medium", "large"]
